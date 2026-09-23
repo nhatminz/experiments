@@ -52,6 +52,27 @@ Important optional overrides are `STUDENT_MODEL`, `TEACHER_MODEL`,
 `NORMAL_ROLLOUT_HORIZON`, `MIN_ORIGINAL_SUFFIX_TOKENS`,
 `ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION`, and `ROLLOUT_VLLM_MAX_MODEL_LEN`.
 
+## Four GPUs: four independent seeds
+
+The before/update/after sequence within one intervention run is inherently
+sequential. Use four GPUs for four independent repetitions, one vLLM replica
+per physical GPU:
+
+```bash
+cd /workspace/storage-shared/nlp/minhpn19/Experiment
+MAIN_REPO=/workspace/storage-shared/nlp/minhpn19/BellmanOPD_analysis \
+GPU_LIST=0,1,2,3 SEEDS="42 43 44 45" \
+MAX_STEPS=100 NUM_PROBE_ROLLOUTS=4 FUTURE_HORIZON=256 TOP_K=16 \
+LEARNING_RATE=5e-6 ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION=0.60 \
+ROLLOUT_VLLM_MAX_MODEL_LEN=5500 \
+  bash scripts/run_parallel.sh
+```
+
+Each process resolves the physical CUDA UUID and holds an exclusive file lock
+for its complete lifetime. A duplicate GPU assignment therefore fails
+immediately instead of allowing two vLLM engines to reserve KV cache on one
+B200. The runner also validates free VRAM before spawning vLLM.
+
 Re-run only the matched-g analysis without inference:
 
 ```bash

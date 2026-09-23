@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gzip
 import hashlib
 import json
@@ -17,6 +18,7 @@ from typing import Any
 import torch
 
 from analyze import analyze_output
+from gpu_isolation import exclusive_gpu_lease
 from protocol import (
     assert_finite_values,
     assert_paired_probe_protocol,
@@ -34,6 +36,53 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
+
+
+def _cuda_device_identity(device_index: int = 0) -> str:
+    """Return a stable identity for the physical device behind logical CUDA 0."""
+    properties = torch.cuda.get_device_properties(device_index)
+    for attribute in ("uuid", "pci_bus_id"):
+        value = getattr(properties, attribute, None)
+        if value:
+            return str(value)
+    # Older PyTorch builds may omit UUID and PCI bus ID. The launcher enforces
+    # exactly one CUDA_VISIBLE_DEVICES entry, which is still a better identity
+    # than logical cuda:0 (every independently launched process calls it zero).
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        return f"visible-{visible}"
+    return (
+        f"logical-{device_index}-{properties.name}-"
+        f"{int(properties.total_memory)}"
+    )
+
+
+def _validate_vllm_startup_memory(config: dict[str, Any]) -> dict[str, float]:
+    """Fail before vLLM startup when another process already occupies the GPU."""
+    free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+    settings = config["rollout"]["vllm"]
+    utilization = float(settings["gpu_memory_utilization"])
+    headroom_gib = _env_float("VLLM_STARTUP_HEADROOM_GIB", 4.0)
+    if headroom_gib < 0:
+        raise ValueError("VLLM_STARTUP_HEADROOM_GIB cannot be negative")
+    required_bytes = int(total_bytes * utilization + headroom_gib * 2**30)
+    if free_bytes < required_bytes:
+        raise RuntimeError(
+            "Not enough free VRAM to start the Experiment vLLM replica: "
+            f"need at least {required_bytes / 2**30:.1f} GiB free "
+            f"(gpu_memory_utilization={utilization:.3f} plus "
+            f"{headroom_gib:.1f} GiB startup headroom), but only "
+            f"{free_bytes / 2**30:.1f} of {total_bytes / 2**30:.1f} GiB is free. "
+            "This normally means another process is using the selected physical "
+            "GPU. Do not bypass this check by lowering headroom; select a free GPU."
+        )
+    return {
+        "free_gib": free_bytes / 2**30,
+        "total_gib": total_bytes / 2**30,
+        "required_gib": required_bytes / 2**30,
+        "utilization": utilization,
+        "headroom_gib": headroom_gib,
+    }
 
 
 def _git_commit(repo: Path) -> str:
@@ -417,8 +466,14 @@ def run(args: argparse.Namespace) -> Path:
     _validate_config(config)
     if not torch.cuda.is_available():
         raise RuntimeError("The B200 intervention experiment requires CUDA")
+    if torch.cuda.device_count() != 1:
+        raise RuntimeError(
+            "Experiment requires exactly one visible GPU per process; got "
+            f"{torch.cuda.device_count()}. Set CUDA_VISIBLE_DEVICES to one device."
+        )
     torch.cuda.set_device(0)
     device = torch.device("cuda", 0)
+    physical_gpu = _cuda_device_identity(0)
     distributed = DistributedContext(0, 0, 1, device)
     seed = int(config["experiment"]["seed"])
     seed_everything(seed)
@@ -434,10 +489,22 @@ def run(args: argparse.Namespace) -> Path:
     del prompt_tokenizer
     save_config(config, output_dir / "resolved_config.yaml")
 
+    gpu_lease = exclusive_gpu_lease(physical_gpu)
+    gpu_lease.__enter__()
     engine = VLLMRolloutEngine(config, output_dir)
-    engine.start()
     student = teacher = tokenizer = None
     try:
+        memory_preflight = _validate_vllm_startup_memory(config)
+        print(
+            "GPU isolation: "
+            f"physical={physical_gpu} "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+            f"free={memory_preflight['free_gib']:.1f}/"
+            f"{memory_preflight['total_gib']:.1f} GiB "
+            f"required={memory_preflight['required_gib']:.1f} GiB",
+            flush=True,
+        )
+        engine.start()
         student, teacher, tokenizer, model_metadata = load_models(config, device)
         config["_tokenizer_eos_token_id"] = tokenizer.eos_token_id
         config["_tokenizer_pad_token_id"] = tokenizer.pad_token_id
@@ -480,10 +547,13 @@ def run(args: argparse.Namespace) -> Path:
         num_probes = int(intervention["num_probe_rollouts"])
         min_suffix = int(intervention["min_original_suffix_tokens"])
         max_attempts = int(intervention["max_selection_attempts"])
-        with (
-            events_path.open("w", encoding="utf-8") as events_handle,
-            gzip.open(audit_path, "wt", encoding="utf-8") as audit_handle,
-        ):
+        with contextlib.ExitStack() as output_stack:
+            events_handle = output_stack.enter_context(
+                events_path.open("w", encoding="utf-8")
+            )
+            audit_handle = output_stack.enter_context(
+                gzip.open(audit_path, "wt", encoding="utf-8")
+            )
             for event_id in range(max_steps):
                 selected = None
                 for attempt in range(max_attempts):
@@ -720,8 +790,13 @@ def run(args: argparse.Namespace) -> Path:
                 )
         analyze_output(output_dir, int(intervention["matched_g_bins"]))
     finally:
-        engine.close()
-        distributed.close()
+        try:
+            engine.close()
+        finally:
+            try:
+                distributed.close()
+            finally:
+                gpu_lease.__exit__(None, None, None)
     return output_dir
 
 

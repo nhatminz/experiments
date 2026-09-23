@@ -21,7 +21,7 @@ export ROLLOUT_VLLM_MAX_MODEL_LEN="${ROLLOUT_VLLM_MAX_MODEL_LEN:-5500}"
 # STORAGE_ROOT, NORMAL_ROLLOUT_HORIZON, MIN_ORIGINAL_SUFFIX_TOKENS.
 # -----------------------------------------------------------
 
-if [[ "${CUDA_VISIBLE_DEVICES}" == *,* ]]; then
+if [[ -z "${CUDA_VISIBLE_DEVICES//[[:space:]]/}" || "${CUDA_VISIBLE_DEVICES}" == *,* ]]; then
   echo "Experiment is single-GPU; set CUDA_VISIBLE_DEVICES to exactly one GPU" >&2
   exit 2
 fi
@@ -47,6 +47,7 @@ echo "Paired suffix rollouts/state: ${NUM_PROBE_ROLLOUTS}"
 echo "Future horizon: ${FUTURE_HORIZON}"
 echo "Student Top-K: ${TOP_K}"
 echo "Learning rate: ${LEARNING_RATE}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES} (physical GPU UUID is locked by the runner)"
 
 cd "${EXPERIMENT_DIR}"
 exec "${PYTHON_BIN}" run_experiment.py \
