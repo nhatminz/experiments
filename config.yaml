@@ -1,0 +1,46 @@
+# Overlay on BellmanOPD_analysis/configs/qwen3_b200_cmt.yaml.
+# Model/data paths and OPD/CMT definitions are inherited from the main repo.
+experiment:
+  method: cmt
+  require_b200: true
+  allow_existing_output: false
+
+rollout:
+  backend: vllm
+  batch_size: 1
+  num_responses: 1
+  max_new_tokens: 4096
+  temperature: 1.0
+  top_p: 1.0
+  vllm:
+    gpu_memory_utilization: 0.60
+    max_num_seqs: 4
+    max_model_len: 5500
+    max_concurrent_requests: 4
+
+training:
+  epochs: 1
+  max_steps: 100
+  micro_batch_size_per_gpu: 1
+  ppo_mini_batch_size: 1
+  learning_rate: 5.0e-6
+  save_checkpoints: false
+  save_optimizer: false
+
+training_evaluation:
+  enabled: false
+
+logging:
+  tensorboard:
+    enabled: false
+  selected_tokens_enabled: false
+  token_score_stats_enabled: false
+  cmt_token_audit_enabled: false
+
+intervention:
+  num_probe_rollouts: 4
+  future_horizon: 256
+  min_original_suffix_tokens: 32
+  max_selection_attempts: 20
+  matched_g_bins: 4
+
