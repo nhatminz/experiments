@@ -40,7 +40,7 @@ declare -a NAMES=()
 for index in "${!GPUS[@]}"; do
   gpu="${GPUS[$index]//[[:space:]]/}"
   seed="${SEED_VALUES[$index]}"
-  name="${RUN_NAME_PREFIX:-cmt_state_intervention}_seed${seed}_${PARALLEL_TAG}"
+  name="${RUN_NAME_PREFIX:-figure1_state_intervention}_seed${seed}_${PARALLEL_TAG}"
   log_path="${LOG_ROOT}/${name}.log"
   echo "Starting ${name}: physical GPU ${gpu}, seed ${seed}, log ${log_path}"
   env \

@@ -5,8 +5,9 @@ from pathlib import Path
 
 
 EXPERIMENT_ROOT = Path(__file__).resolve().parents[1]
-if str(EXPERIMENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(EXPERIMENT_ROOT))
+WORKSPACE_ROOT = EXPERIMENT_ROOT.parent
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
 MAIN_REPO = EXPERIMENT_ROOT.parent / "BellmanOPD_analysis"
 if str(MAIN_REPO) not in sys.path:
     sys.path.insert(0, str(MAIN_REPO))

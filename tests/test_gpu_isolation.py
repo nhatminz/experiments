@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from gpu_isolation import exclusive_gpu_lease
+from Experiment.gpu_isolation import exclusive_gpu_lease
 
 
 def test_duplicate_physical_gpu_lease_fails_immediately(tmp_path, monkeypatch):

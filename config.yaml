@@ -1,46 +1,67 @@
-# Overlay on BellmanOPD_analysis/configs/qwen3_b200_cmt.yaml.
-# Model/data paths and OPD/CMT definitions are inherited from the main repo.
+# Standalone Figure-1 experiment. This is merged onto qwen3_b200_base.yaml;
+# no CMT/TA selector or training objective is invoked.
 experiment:
-  method: cmt
+  protocol: fixed_base_single_state_reverse_kl_v1
+  seed: 42
   require_b200: true
-  allow_existing_output: false
+  allow_existing_output: true
+
+models:
+  teacher_path: models/Qwen3-4B
+  student_path: nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base
+  teacher_no_think: true
+  dtype: bfloat16
+
+data:
+  path: nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet
+  split: null
+  prompt_key: problem
+  prefer_source_prompt: false
+  max_prompt_tokens: 1024
+  overlong_prompt_policy: filter
+  chat_template_kwargs:
+    enable_thinking: false
 
 rollout:
   backend: vllm
-  batch_size: 1
+  batch_size: 8
   num_responses: 1
   max_new_tokens: 4096
   temperature: 1.0
   top_p: 1.0
   vllm:
     gpu_memory_utilization: 0.60
-    max_num_seqs: 4
+    max_num_seqs: 16
     max_model_len: 5500
-    max_concurrent_requests: 4
+    max_concurrent_requests: 16
 
 training:
-  epochs: 1
-  max_steps: 100
-  micro_batch_size_per_gpu: 1
-  ppo_mini_batch_size: 1
+  gradient_checkpointing: true
+  use_lora: false
   learning_rate: 5.0e-6
+  adam_betas: [0.9, 0.95]
+  weight_decay: 0.0
+  max_grad_norm: 1.0
   save_checkpoints: false
   save_optimizer: false
 
 training_evaluation:
   enabled: false
 
+intervention:
+  num_states: 300
+  top_k: 16
+  num_continuations: 8
+  future_horizon: 128
+  min_original_suffix_tokens: 1
+  min_response_position: 8
+  candidate_collection_batch_size: 8
+  matched_quantile_low: 0.45
+  matched_quantile_high: 0.55
+  sensitivity_quantile_low: 0.40
+  sensitivity_quantile_high: 0.60
+
 logging:
   tensorboard:
-    enabled: false
-  selected_tokens_enabled: false
-  token_score_stats_enabled: false
-  cmt_token_audit_enabled: false
-
-intervention:
-  num_probe_rollouts: 4
-  future_horizon: 256
-  min_original_suffix_tokens: 32
-  max_selection_attempts: 20
-  matched_g_bins: 4
-
+    enabled: true
+    log_dir: tensorboard

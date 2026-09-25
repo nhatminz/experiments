@@ -1,165 +1,129 @@
 #!/usr/bin/env python3
-"""Sequential causal interventions at student-generated CMT states."""
+"""Run independent single-state interventions from one fixed base checkpoint."""
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import gzip
-import hashlib
+import gc
 import json
 import os
-import subprocess
+import random
 import sys
 from pathlib import Path
-from statistics import fmean, pstdev
 from typing import Any
 
 import torch
+import yaml
 
-from analyze import analyze_output
-from gpu_isolation import exclusive_gpu_lease
-from protocol import (
-    assert_finite_values,
-    assert_paired_probe_protocol,
+from .gpu_isolation import exclusive_gpu_lease
+from .plotting import analyze_output
+from .protocol import (
+    assert_same_prefix_independent_branches,
+    branch_seed_sets,
     build_state_prefix,
+    descendant_offsets,
     fixed_support_reverse_kl,
-    paired_rollout_seeds,
+    future_distribution_stats,
     select_state_position,
-    single_state_objective_mask,
+)
+from .utils import (
+    ProgressLogger,
+    append_gzip_jsonl,
+    append_jsonl,
+    environment_payload,
+    read_jsonl,
+    pending_candidates,
+    restore_parameters_exact,
+    sanitize_continuation_audit,
+    snapshot_parameters,
+    validate_intervention_schema,
 )
 
 
-def _env_int(name: str, default: int) -> int:
-    return int(os.environ.get(name, default))
+def _env_int(name: str, default: int, *aliases: str) -> int:
+    for key in (name, *aliases):
+        if key in os.environ:
+            return int(os.environ[key])
+    return int(default)
 
 
 def _env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
-def _cuda_device_identity(device_index: int = 0) -> str:
-    """Return a stable identity for the physical device behind logical CUDA 0."""
-    properties = torch.cuda.get_device_properties(device_index)
-    for attribute in ("uuid", "pci_bus_id"):
-        value = getattr(properties, attribute, None)
-        if value:
-            return str(value)
-    # Older PyTorch builds may omit UUID and PCI bus ID. The launcher enforces
-    # exactly one CUDA_VISIBLE_DEVICES entry, which is still a better identity
-    # than logical cuda:0 (every independently launched process calls it zero).
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if visible:
-        return f"visible-{visible}"
-    return (
-        f"logical-{device_index}-{properties.name}-"
-        f"{int(properties.total_memory)}"
-    )
+def _eos_ids(tokenizer) -> list[int]:
+    value = tokenizer.eos_token_id
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
 
 
-def _validate_vllm_startup_memory(config: dict[str, Any]) -> dict[str, float]:
-    """Fail before vLLM startup when another process already occupies the GPU."""
-    free_bytes, total_bytes = torch.cuda.mem_get_info(0)
-    settings = config["rollout"]["vllm"]
-    utilization = float(settings["gpu_memory_utilization"])
-    headroom_gib = _env_float("VLLM_STARTUP_HEADROOM_GIB", 4.0)
-    if headroom_gib < 0:
-        raise ValueError("VLLM_STARTUP_HEADROOM_GIB cannot be negative")
-    required_bytes = int(total_bytes * utilization + headroom_gib * 2**30)
-    if free_bytes < required_bytes:
-        raise RuntimeError(
-            "Not enough free VRAM to start the Experiment vLLM replica: "
-            f"need at least {required_bytes / 2**30:.1f} GiB free "
-            f"(gpu_memory_utilization={utilization:.3f} plus "
-            f"{headroom_gib:.1f} GiB startup headroom), but only "
-            f"{free_bytes / 2**30:.1f} of {total_bytes / 2**30:.1f} GiB is free. "
-            "This normally means another process is using the selected physical "
-            "GPU. Do not bypass this check by lowering headroom; select a free GPU."
-        )
-    return {
-        "free_gib": free_bytes / 2**30,
-        "total_gib": total_bytes / 2**30,
-        "required_gib": required_bytes / 2**30,
-        "utilization": utilization,
-        "headroom_gib": headroom_gib,
-    }
-
-
-def _git_commit(repo: Path) -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        return "unavailable"
-
-
-def _load_resolved_config(main_repo: Path, overlay_path: Path, output_dir: Path):
+def _load_resolved_config(main_repo: Path, overlay: Path, output_dir: Path):
     from b200_experiment.config import deep_merge, load_config, resolve_runtime_paths
 
     config = deep_merge(
-        load_config(main_repo / "configs/qwen3_b200_cmt.yaml"),
-        load_config(overlay_path),
+        load_config(main_repo / "configs/qwen3_b200_base.yaml"),
+        load_config(overlay),
     )
     config["experiment"]["output_dir"] = str(output_dir)
-    config["experiment"]["seed"] = _env_int(
-        "SEED", int(config["experiment"].get("seed", 42))
-    )
     config["paths"]["storage_root"] = os.environ.get(
         "STORAGE_ROOT", config["paths"]["storage_root"]
     )
-    if os.environ.get("STUDENT_MODEL"):
-        config["models"]["student_path"] = os.environ["STUDENT_MODEL"]
-    if os.environ.get("TEACHER_MODEL"):
-        config["models"]["teacher_path"] = os.environ["TEACHER_MODEL"]
-    if os.environ.get("TRAIN_DATA"):
-        config["data"]["path"] = os.environ["TRAIN_DATA"]
-    if os.environ.get("PROMPT_KEY"):
-        config["data"]["prompt_key"] = os.environ["PROMPT_KEY"]
+    for env_name, section, key in (
+        ("STUDENT_MODEL", "models", "student_path"),
+        ("TEACHER_MODEL", "models", "teacher_path"),
+        ("TRAIN_DATA", "data", "path"),
+        ("PROMPT_KEY", "data", "prompt_key"),
+    ):
+        if os.environ.get(env_name):
+            config[section][key] = os.environ[env_name]
     if "TRAIN_DATA_SPLIT" in os.environ:
         value = os.environ["TRAIN_DATA_SPLIT"].strip()
-        config["data"]["split"] = (
-            None if value.lower() in {"", "none", "null"} else value
-        )
+        config["data"]["split"] = None if value.lower() in {"", "none", "null"} else value
 
-    intervention = config["intervention"]
-    intervention["num_probe_rollouts"] = _env_int(
-        "NUM_PROBE_ROLLOUTS", intervention["num_probe_rollouts"]
+    config["experiment"]["seed"] = _env_int(
+        "SEED", config["experiment"].get("seed", 42)
     )
-    intervention["future_horizon"] = _env_int(
-        "FUTURE_HORIZON", intervention["future_horizon"]
+    settings = config["intervention"]
+    settings["num_states"] = _env_int(
+        "NUM_STATES", settings["num_states"], "MAX_STEPS"
     )
-    intervention["min_original_suffix_tokens"] = _env_int(
-        "MIN_ORIGINAL_SUFFIX_TOKENS", intervention["min_original_suffix_tokens"]
+    settings["num_continuations"] = _env_int(
+        "NUM_CONTINUATIONS", settings["num_continuations"], "K_ROLLOUTS",
+        "NUM_PROBE_ROLLOUTS"
     )
-    intervention["max_selection_attempts"] = _env_int(
-        "MAX_SELECTION_ATTEMPTS", intervention["max_selection_attempts"]
+    settings["future_horizon"] = _env_int(
+        "FUTURE_HORIZON", settings["future_horizon"]
     )
-    intervention["matched_g_bins"] = _env_int(
-        "MATCHED_G_BINS", intervention["matched_g_bins"]
+    settings["top_k"] = _env_int("TOP_K", settings["top_k"])
+    settings["min_original_suffix_tokens"] = _env_int(
+        "MIN_ORIGINAL_SUFFIX_TOKENS", settings["min_original_suffix_tokens"]
     )
-    config["training"]["max_steps"] = _env_int(
-        "MAX_STEPS", int(config["training"]["max_steps"])
+    settings["min_response_position"] = _env_int(
+        "MIN_RESPONSE_POSITION", settings.get("min_response_position", 8)
     )
+    settings["candidate_collection_batch_size"] = _env_int(
+        "CANDIDATE_COLLECTION_BATCH_SIZE", settings["candidate_collection_batch_size"]
+    )
+    for env_name, key in (
+        ("MATCHED_QUANTILE_LOW", "matched_quantile_low"),
+        ("MATCHED_QUANTILE_HIGH", "matched_quantile_high"),
+        ("SENSITIVITY_QUANTILE_LOW", "sensitivity_quantile_low"),
+        ("SENSITIVITY_QUANTILE_HIGH", "sensitivity_quantile_high"),
+    ):
+        settings[key] = _env_float(env_name, settings[key])
     config["training"]["learning_rate"] = _env_float(
-        "LEARNING_RATE", float(config["training"]["learning_rate"])
+        "LEARNING_RATE", config["training"]["learning_rate"]
     )
-    # These are protocol invariants, not user-tunable batching semantics.
-    config["training"]["ppo_mini_batch_size"] = 1
-    config["training"]["micro_batch_size_per_gpu"] = 1
-    config["training"]["epochs"] = 1
-    config["training"]["save_checkpoints"] = False
-    config["training"]["save_optimizer"] = False
-    config["training_evaluation"]["enabled"] = False
-    config["selector"]["top_k"] = _env_int("TOP_K", int(config["selector"]["top_k"]))
     config["rollout"]["max_new_tokens"] = _env_int(
-        "NORMAL_ROLLOUT_HORIZON", int(config["rollout"]["max_new_tokens"])
+        "CANDIDATE_ROLLOUT_HORIZON", config["rollout"]["max_new_tokens"],
+        "NORMAL_ROLLOUT_HORIZON"
     )
     config["rollout"]["temperature"] = _env_float(
-        "ROLLOUT_TEMPERATURE", float(config["rollout"]["temperature"])
+        "ROLLOUT_TEMPERATURE", config["rollout"]["temperature"]
     )
     config["rollout"]["top_p"] = _env_float(
-        "ROLLOUT_TOP_P", float(config["rollout"]["top_p"])
+        "ROLLOUT_TOP_P", config["rollout"]["top_p"]
     )
     vllm = config["rollout"]["vllm"]
     vllm["gpu_memory_utilization"] = _env_float(
@@ -168,648 +132,562 @@ def _load_resolved_config(main_repo: Path, overlay_path: Path, output_dir: Path)
     vllm["max_model_len"] = _env_int(
         "ROLLOUT_VLLM_MAX_MODEL_LEN", vllm["max_model_len"]
     )
-    vllm["max_num_seqs"] = max(
-        int(vllm.get("max_num_seqs", 4)), int(intervention["num_probe_rollouts"])
+    needed = max(
+        settings["num_continuations"], settings["candidate_collection_batch_size"]
     )
+    vllm["max_num_seqs"] = max(int(vllm.get("max_num_seqs", 1)), needed)
     vllm["max_concurrent_requests"] = max(
-        int(vllm.get("max_concurrent_requests", 4)),
-        int(intervention["num_probe_rollouts"]),
+        int(vllm.get("max_concurrent_requests", 1)), needed
     )
     return resolve_runtime_paths(config)
 
 
 def _validate_config(config: dict[str, Any]) -> None:
+    settings = config["intervention"]
     positive = {
-        "MAX_STEPS": config["training"]["max_steps"],
-        "NUM_PROBE_ROLLOUTS": config["intervention"]["num_probe_rollouts"],
-        "FUTURE_HORIZON": config["intervention"]["future_horizon"],
-        "TOP_K": config["selector"]["top_k"],
-        "MIN_ORIGINAL_SUFFIX_TOKENS": config["intervention"][
-            "min_original_suffix_tokens"
-        ],
+        "num_states": settings["num_states"],
+        "num_continuations": settings["num_continuations"],
+        "future_horizon": settings["future_horizon"],
+        "candidate_collection_batch_size": settings["candidate_collection_batch_size"],
     }
-    invalid = {key: value for key, value in positive.items() if int(value) <= 0}
-    if invalid:
-        raise ValueError(f"Experiment settings must be positive: {invalid}")
+    if any(int(value) <= 0 for value in positive.values()):
+        raise ValueError(f"Experiment settings must be positive: {positive}")
+    if int(settings["top_k"]) != 16:
+        raise ValueError("The canonical experiment fixes local support to Student Top-16")
     if float(config["training"]["learning_rate"]) <= 0:
-        raise ValueError("LEARNING_RATE must be positive")
+        raise ValueError("learning_rate must be positive")
     if config["rollout"]["backend"] != "vllm":
-        raise ValueError(
-            "This intervention experiment requires the existing vLLM backend"
-        )
-
-
-def _score_cmt_rollout(student, teacher, rollout, config):
-    from b200_experiment.scoring import score_student_teacher_rollout
-    from b200_experiment.selectors import CMTSelector, PGTSelector
-
-    selector = config["selector"]
-    student_scores, teacher_scores = score_student_teacher_rollout(
-        student,
-        teacher,
-        rollout,
-        score_chunk_steps=int(selector.get("score_chunk_steps", 128)),
-        top_k=int(selector["top_k"]),
-        student_temperature=float(config["rollout"].get("temperature", 1.0)),
-        teacher_temperature=float(
-            config.get("opd", {}).get("teacher_temperature", 1.0)
-        ),
-        micro_batch_size=int(selector.get("score_micro_batch_size", 1)),
-        trim_padding=bool(selector.get("trim_padding", True)),
-        length_bucketed=bool(selector.get("length_bucketed_scoring", True)),
-        compute_full_vocab_metrics=False,
-    )
-    if any(
-        value is None
-        for value in (
-            student_scores.top_k_ids,
-            student_scores.top_k_log_probs,
-            student_scores.candidate_log_probs,
-            teacher_scores.top_k_ids,
-            teacher_scores.top_k_log_probs,
-            teacher_scores.candidate_log_probs,
-        )
+        raise ValueError("This experiment requires the existing vLLM rollout backend")
+    for low_key, high_key in (
+        ("matched_quantile_low", "matched_quantile_high"),
+        ("sensitivity_quantile_low", "sensitivity_quantile_high"),
     ):
-        raise AssertionError("Joint scoring did not return every compact Top-K tensor")
-    pgt = PGTSelector().compute_scores_from_topk(
-        student_scores.top_k_ids,
-        teacher_scores.top_k_ids,
-        student_scores.top_k_log_probs,
-        teacher_scores.candidate_log_probs,
-        teacher_scores.top_k_log_probs,
-        student_scores.candidate_log_probs,
-        rollout.valid_mask,
-        token_chunk_size=int(selector.get("pgt_vocab_chunk_tokens", 2048)),
-        gain_support="student_topk",
-    )
-    cmt = CMTSelector(
-        gamma=float(selector.get("cmt_gamma", 1.0)),
-        successor_lambda=float(selector.get("cmt_successor_lambda", 1.0)),
-        ablation_arm="g_d",
-    ).compute_scores(pgt, rollout.response_ids, rollout.valid_mask)
-    return student_scores, teacher_scores, pgt, cmt
+        low, high = float(settings[low_key]), float(settings[high_key])
+        if not 0.0 <= low < high <= 1.0:
+            raise ValueError(f"Invalid quantile interval: {low_key}={low}, {high_key}={high}")
 
 
-def _slice_local_rollout(rollout, position_t: int):
-    from b200_experiment.scoring import RolloutBatch
-
-    stop = int(position_t) + 1
-    input_stop = rollout.prompt_width + stop
-    return RolloutBatch(
-        input_ids=rollout.input_ids[:, :input_stop].clone(),
-        attention_mask=rollout.attention_mask[:, :input_stop].clone(),
-        response_ids=rollout.response_ids[:, :stop].clone(),
-        valid_mask=rollout.valid_mask[:, :stop].clone(),
-        rollout_log_probs=rollout.rollout_log_probs[:, :stop].clone(),
-        prompt_width=rollout.prompt_width,
-    )
-
-
-def _local_fixed_support_kl_after(
-    student, local_rollout, candidate_ids, teacher_logp, config
-):
-    from b200_experiment.scoring import score_original_rollout
-
-    scores = score_original_rollout(
-        student,
-        local_rollout,
-        keep_cache=False,
-        score_chunk_steps=int(config["selector"].get("score_chunk_steps", 128)),
-        retain_response_logits=False,
-        top_k=0,
-        candidate_ids=candidate_ids,
-        temperature=float(config["rollout"].get("temperature", 1.0)),
-        micro_batch_size=1,
-        trim_padding=True,
-        length_bucketed=False,
-    )
-    if scores.candidate_log_probs is None:
-        raise AssertionError("Fixed-support post-update scoring returned no candidates")
-    return fixed_support_reverse_kl(scores.candidate_log_probs[:, -1], teacher_logp)
+def _resume_signature(config: dict[str, Any]) -> dict[str, Any]:
+    """Fields that would alter an already-started scientific run."""
+    return {
+        "protocol": config["experiment"]["protocol"],
+        "seed": config["experiment"]["seed"],
+        "models": config["models"],
+        "data": config["data"],
+        "sampling": {
+            key: config["rollout"][key]
+            for key in ("max_new_tokens", "temperature", "top_p")
+        },
+        "intervention": config["intervention"],
+        "local_optimizer": {
+            key: config["training"][key]
+            for key in ("learning_rate", "adam_betas", "weight_decay", "max_grad_norm")
+        },
+    }
 
 
-def _probe_prefix_batch(prefix: torch.Tensor, count: int):
+def _cuda_identity() -> str:
+    properties = torch.cuda.get_device_properties(0)
+    value = getattr(properties, "uuid", None) or getattr(properties, "pci_bus_id", None)
+    return str(value or f"{os.environ.get('CUDA_VISIBLE_DEVICES', '0')}-{properties.name}")
+
+
+def _prefix_batch(prefix: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:
     ids = prefix.unsqueeze(0).repeat(int(count), 1)
     return ids, torch.ones_like(ids, dtype=torch.long)
 
 
-def _run_probe_phase(
-    phase: str,
-    engine,
-    student,
-    teacher,
-    prefix: torch.Tensor,
-    paired_seeds: tuple[int, ...],
-    event_id: int,
-    config: dict[str, Any],
-    audit_handle,
-):
-    count = len(paired_seeds)
-    if tuple(paired_seeds) != paired_rollout_seeds(int(paired_seeds[0]), count):
-        raise ValueError(
-            "The existing vLLM batch API requires consecutive per-row probe seeds"
+def _generate_suffixes(engine, model, prefix, seeds, config, tokenizer):
+    if tuple(seeds) != tuple(range(int(seeds[0]), int(seeds[0]) + len(seeds))):
+        raise ValueError("vLLM batch generation requires consecutive row seeds")
+    prompt_ids, prompt_mask = _prefix_batch(prefix, len(seeds))
+    horizon = int(config["intervention"]["future_horizon"])
+    # L+1 generated actions expose L descendant pre-action states to the
+    # causal-LM scorer after excluding s_t at offset zero.
+    generation_tokens = horizon + 1
+    if prefix.numel() + generation_tokens > int(config["rollout"]["vllm"]["max_model_len"]):
+        raise ValueError("State prefix plus future horizon exceeds vLLM max_model_len")
+    with torch.inference_mode():
+        return engine.generate(
+            model,
+            prompt_ids,
+            prompt_mask,
+            max_new_tokens=generation_tokens,
+            temperature=float(config["rollout"]["temperature"]),
+            top_p=float(config["rollout"]["top_p"]),
+            eos_token_ids=_eos_ids(tokenizer),
+            pad_token_id=int(tokenizer.pad_token_id),
+            seed=int(seeds[0]),
         )
-    prompt_ids, prompt_mask = _probe_prefix_batch(prefix, count)
-    max_model_len = int(config["rollout"]["vllm"]["max_model_len"])
-    future_horizon = int(config["intervention"]["future_horizon"])
-    if prefix.numel() + future_horizon > max_model_len:
-        raise ValueError(
-            f"Exact prefix ({prefix.numel()}) + FUTURE_HORIZON ({future_horizon}) "
-            f"exceeds vLLM max_model_len={max_model_len}"
+
+
+def _next_token_logits(model, prefix: torch.Tensor) -> torch.Tensor:
+    attention = torch.ones_like(prefix, dtype=torch.long).unsqueeze(0)
+    output = model(input_ids=prefix.unsqueeze(0), attention_mask=attention, use_cache=False)
+    return output.logits[:, -1, :]
+
+
+def _single_local_update(student, teacher, prefix, config):
+    """One AdamW step on D0 itself, on one fixed Student-Top-16 support."""
+    top_k = int(config["intervention"]["top_k"])
+    student.eval()
+    teacher.eval()
+    with torch.inference_mode():
+        base_student_logits = _next_token_logits(student, prefix)
+        support_ids = torch.topk(base_student_logits, k=top_k, dim=-1).indices
+        teacher_logits = _next_token_logits(teacher, prefix)
+        fixed_teacher = teacher_logits.gather(-1, support_ids).detach()
+        fixed_student_before = base_student_logits.gather(-1, support_ids).detach()
+        p_before = torch.softmax(fixed_student_before.float(), dim=-1)
+        q_fixed = torch.softmax(fixed_teacher.float(), dim=-1)
+        d0_value = float(
+            fixed_support_reverse_kl(fixed_student_before, fixed_teacher).item()
         )
-    rollout = engine.generate(
-        student,
-        prompt_ids,
-        prompt_mask,
-        max_new_tokens=future_horizon,
-        temperature=float(config["rollout"]["temperature"]),
-        top_p=float(config["rollout"]["top_p"]),
-        eos_token_ids=config["_tokenizer_eos_token_id"],
-        pad_token_id=int(config["_tokenizer_pad_token_id"]),
-        seed=int(paired_seeds[0]),
-        sample_seed_offset=0,
+
+    # Tensors created inside inference_mode cannot be saved by autograd. Make
+    # ordinary immutable copies for the one differentiable local forward.
+    support_ids = support_ids.clone()
+    fixed_teacher = fixed_teacher.clone()
+
+    # Keep evaluation mode so the differentiable D0 is the exact same
+    # categorical object measured above (gradients remain enabled in eval mode).
+    student.eval()
+    trainable = [parameter for parameter in student.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable,
+        lr=float(config["training"]["learning_rate"]),
+        betas=tuple(float(x) for x in config["training"]["adam_betas"]),
+        weight_decay=float(config["training"]["weight_decay"]),
+        fused=bool(torch.cuda.is_available()),
     )
-    student_scores, teacher_scores, pgt, _ = _score_cmt_rollout(
-        student, teacher, rollout, config
+    optimizer.zero_grad(set_to_none=True)
+    logits = _next_token_logits(student, prefix).gather(-1, support_ids)
+    loss = fixed_support_reverse_kl(logits, fixed_teacher).mean()
+    loss.backward()
+    gradient_norm = torch.nn.utils.clip_grad_norm_(
+        trainable, float(config["training"]["max_grad_norm"])
     )
-    kl = pgt.diagnostics["restricted_reverse_kl"].detach().float()
-    student_topk_logp = student_scores.top_k_log_probs.detach().float()
-    teacher_on_student_logp = teacher_scores.candidate_log_probs.detach().float()
-    student_topk_weights = torch.softmax(student_topk_logp, dim=-1)
-    # Existing only_stu/student_p OPD divergence proxy: the negative sum of
-    # candidate rewards. Unlike restricted_reverse_kl, q is not separately
-    # renormalized on Student Top-K, so these quantities are deliberately logged
-    # as distinct measurements.
-    opd_proxy = (
-        student_topk_weights * (student_topk_logp - teacher_on_student_logp)
-    ).sum(dim=-1)
-    # Offset 0 scores s_t itself (the distribution that emits the first probe
-    # token). Downstream state quality starts at s_{t+1}, after one newly
-    # sampled action has actually changed the visited prefix.
-    future_mask = rollout.valid_mask.clone()
-    future_mask[:, 0] = False
-    values = [float(value) for value in kl[future_mask].cpu().tolist()]
-    opd_values = [float(value) for value in opd_proxy[future_mask].cpu().tolist()]
-    if not values:
-        raise RuntimeError(f"{phase} probe produced no valid future states")
-    lengths = [int(value) for value in rollout.valid_mask.sum(dim=-1).cpu().tolist()]
-    for row_index, seed in enumerate(paired_seeds):
-        for offset in range(1, lengths[row_index]):
-            record = {
-                "event_id": int(event_id),
-                "phase": phase,
-                "rollout_seed": int(seed),
-                "future_offset": int(offset),
-                "restricted_reverse_kl": float(kl[row_index, offset].item()),
-                "generated_token_id": int(
-                    rollout.response_ids[row_index, offset].item()
-                ),
-            }
-            assert_finite_values(record)
-            audit_handle.write(json.dumps(record, allow_nan=False) + "\n")
-    audit_handle.flush()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    student.eval()
+    with torch.inference_mode():
+        fixed_student_after = _next_token_logits(student, prefix).gather(-1, support_ids)
+        d1_value = float(
+            fixed_support_reverse_kl(fixed_student_after, fixed_teacher).item()
+        )
     return {
-        "mean": fmean(values),
-        "std": pstdev(values) if len(values) > 1 else 0.0,
-        "count": len(values),
-        "lengths": lengths,
-        "opd_proxy_mean": fmean(opd_values),
+        "support_ids": support_ids[0].detach().cpu().tolist(),
+        "p_base_conditional": p_before[0].detach().cpu().tolist(),
+        "q_teacher_conditional": q_fixed[0].detach().cpu().tolist(),
+        "d0": d0_value,
+        "d1": d1_value,
+        "delta_immediate": d0_value - d1_value,
+        "loss": float(loss.detach().item()),
+        "gradient_norm": float(gradient_norm.detach().item()),
+        "optimizer": optimizer,
     }
 
 
-def _local_update(
-    student,
-    optimizer,
-    rollout,
-    student_scores,
-    teacher_scores,
-    position_t: int,
-    config,
-    device,
-    distributed,
-    event_id: int,
-):
-    from b200_experiment.opd_core import build_student_topk_opd_reference
-    from b200_experiment.trainer import _opd_train_step
+def _score_suffixes_with_base(student, teacher, rollout, seeds, phase, config, tokenizer):
+    from b200_experiment.scoring import score_student_teacher_rollout
 
-    local_rollout = _slice_local_rollout(rollout, position_t)
-    local_t = local_rollout.response_ids.shape[1] - 1
-    objective_mask = single_state_objective_mask(local_rollout.valid_mask, local_t)
-    if int(objective_mask.sum().item()) != 1:
-        raise AssertionError("Exactly one local state must enter the OPD objective")
-    reference = build_student_topk_opd_reference(
-        student_scores.top_k_ids[:, : local_t + 1],
-        student_scores.top_k_log_probs[:, : local_t + 1],
-        teacher_scores.candidate_log_probs[:, : local_t + 1],
-        objective_mask,
-        top_k=int(config["selector"]["top_k"]),
-    )
-    outside = ~objective_mask.unsqueeze(-1).expand_as(reference.advantages)
-    if bool(reference.advantages[outside].ne(0).any()):
-        raise AssertionError("Non-intervention states retained OPD advantages")
-    weights = objective_mask.float()
-    metrics = _opd_train_step(
-        student,
-        optimizer,
-        local_rollout,
-        weights,
-        reference,
-        config,
-        device,
-        distributed,
-        objective_valid_mask=objective_mask,
-        trajectory_active_mask=torch.ones(1, dtype=torch.bool, device=device),
-        gibbs_scores=None,
-        gibbs_epsilon=None,
-        rollout_id=event_id,
-        max_optimizer_steps=1,
-        optimizer_step_start=event_id,
-    )
-    if int(metrics["optimizer_steps"]) != 1 or int(metrics["gibbs_allocations"]) != 0:
-        raise AssertionError(
-            "Local intervention must be one update with no Gibbs allocation"
+    selector = config["selector"]
+    with torch.inference_mode():
+        student_scores, teacher_scores = score_student_teacher_rollout(
+            student,
+            teacher,
+            rollout,
+            score_chunk_steps=int(selector.get("score_chunk_steps", 128)),
+            top_k=int(config["intervention"]["top_k"]),
+            student_temperature=1.0,
+            teacher_temperature=1.0,
+            micro_batch_size=int(selector.get("score_micro_batch_size", 8)),
+            trim_padding=bool(selector.get("trim_padding", True)),
+            length_bucketed=bool(selector.get("length_bucketed_scoring", True)),
+            compute_full_vocab_metrics=False,
         )
-    return local_rollout, reference, metrics
+    if student_scores.top_k_log_probs is None or teacher_scores.candidate_log_probs is None:
+        raise AssertionError("Compact Student-TopK scoring did not return candidate values")
+    quality = fixed_support_reverse_kl(
+        student_scores.top_k_log_probs, teacher_scores.candidate_log_probs
+    ).detach().float()
+    branches: list[list[float]] = []
+    audit: list[dict[str, Any]] = []
+    lengths = [int(x) for x in rollout.valid_mask.sum(dim=-1).cpu().tolist()]
+    for row, (seed, length) in enumerate(zip(seeds, lengths)):
+        # Offset zero is s_t itself. Only states after >=1 generated action are used.
+        offsets = descendant_offsets(length)[: int(config["intervention"]["future_horizon"])]
+        values = [float(quality[row, offset].item()) for offset in offsets]
+        branches.append(values)
+        audit.append({
+            "phase": phase,
+            "branch": phase,
+            "continuation_index": row,
+            "rollout_index": row,
+            "seed": int(seed),
+            "generated_token_ids": [
+                int(x) for x in rollout.response_ids[row, :length].detach().cpu().tolist()
+            ],
+            "generated_length": length,
+            "decoded_continuation": tokenizer.decode(
+                rollout.response_ids[row, :length].detach().cpu().tolist(),
+                skip_special_tokens=False,
+            ),
+            "descendant_quality": values,
+            "descendant_offsets": offsets,
+            "num_evaluated_descendant_states": len(values),
+            "mean_future_reverse_kl": (
+                sum(values) / len(values) if values else None
+            ),
+        })
+    return future_distribution_stats(branches), audit, lengths
 
 
-def _append_jsonl(handle, payload: dict[str, Any]) -> None:
-    assert_finite_values(payload)
-    handle.write(json.dumps(payload, allow_nan=False) + "\n")
-    handle.flush()
+def _collect_candidates(
+    path: Path, records, tokenizer, student, engine, config, device, log
+) -> list[dict[str, Any]]:
+    from b200_experiment.data import stable_sample_id, tokenize_prompts
+
+    target = int(config["intervention"]["num_states"])
+    candidates = read_jsonl(path)
+    if len(candidates) > target:
+        raise ValueError("candidate_states.jsonl has more rows than configured num_states")
+    if len(candidates) == target:
+        log(f"Candidate collection already complete: {target}/{target}")
+        return candidates
+    used = {int(row["dataset_index"]) for row in candidates}
+    seed = int(config["experiment"]["seed"])
+    order = list(range(len(records)))
+    random.Random(seed + 101).shuffle(order)
+    batch_size = int(config["intervention"]["candidate_collection_batch_size"])
+    eos_ids = _eos_ids(tokenizer)
+    progress_path = path.with_name("candidate_collection_progress.json")
+    cursor = 0
+    if progress_path.is_file():
+        cursor = int(json.loads(progress_path.read_text(encoding="utf-8"))["cursor"])
+    while len(candidates) < target and cursor < len(order):
+        batch_begin = cursor
+        indices = order[cursor : cursor + batch_size]
+        cursor += len(indices)
+        batch_records = [records[index] for index in indices]
+        encoded, _ = tokenize_prompts(batch_records, tokenizer, config["data"], device)
+        generation_seed = seed + 1_000_000 + batch_begin * 100
+        with torch.inference_mode():
+            rollout = engine.generate(
+                student,
+                encoded["input_ids"],
+                encoded["attention_mask"],
+                max_new_tokens=int(config["rollout"]["max_new_tokens"]),
+                temperature=float(config["rollout"]["temperature"]),
+                top_p=float(config["rollout"]["top_p"]),
+                eos_token_ids=eos_ids,
+                pad_token_id=int(tokenizer.pad_token_id),
+                seed=generation_seed,
+            )
+        for row, (dataset_index, record) in enumerate(zip(indices, batch_records)):
+            if dataset_index in used:
+                continue
+            length = int(rollout.valid_mask[row].sum().item())
+            tokens = rollout.response_ids[row, :length]
+            token_list = [int(x) for x in tokens.detach().cpu().tolist()]
+            try:
+                position = select_state_position(
+                    token_list,
+                    eos_token_ids=eos_ids,
+                    min_suffix_tokens=int(config["intervention"]["min_original_suffix_tokens"]),
+                    min_position=int(config["intervention"].get("min_response_position", 8)),
+                    seed=seed + 2_000_000 + dataset_index,
+                )
+            except ValueError:
+                continue
+            prefix = build_state_prefix(
+                encoded["input_ids"][row], encoded["attention_mask"][row], tokens, position
+            )
+            if prefix.numel() + int(config["intervention"]["future_horizon"]) + 1 > int(
+                config["rollout"]["vllm"]["max_model_len"]
+            ):
+                continue
+            payload = {
+                "candidate_id": len(candidates),
+                "dataset_index": int(dataset_index),
+                "sample_id": stable_sample_id(record, dataset_index),
+                "state_position_t": int(position),
+                "prefix_token_ids": [int(x) for x in prefix.detach().cpu().tolist()],
+                "decoded_prefix": tokenizer.decode(
+                    prefix.detach().cpu().tolist(), skip_special_tokens=False
+                ),
+                "prefix_length": int(prefix.numel()),
+                "trajectory_length": length,
+                "candidate_rollout_seed": generation_seed + row,
+                "action_y_t": token_list[position],
+                "selection": "uniform_valid_interior_position_without_quality_signal",
+            }
+            append_jsonl(path, payload)
+            candidates.append(payload)
+            used.add(dataset_index)
+            if len(candidates) >= target:
+                break
+        temporary = progress_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"cursor": cursor, "candidate_count": len(candidates)}) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(progress_path)
+        log(f"Collected candidate states: {len(candidates)}/{target}")
+    if len(candidates) != target:
+        raise RuntimeError(
+            f"Only collected {len(candidates)}/{target} valid states from distinct prompts"
+        )
+    if len({row["dataset_index"] for row in candidates}) != len(candidates):
+        raise AssertionError("Candidate states are not from distinct prompts")
+    return candidates
 
 
 def run(args: argparse.Namespace) -> Path:
     main_repo = args.main_repo.resolve()
-    if not (main_repo / "b200_experiment/trainer.py").is_file():
+    if not (main_repo / "b200_experiment/models.py").is_file():
         raise FileNotFoundError(f"Invalid MAIN_REPO: {main_repo}")
-    sys.path.insert(0, str(main_repo))
-
+    if str(main_repo) not in sys.path:
+        sys.path.insert(0, str(main_repo))
     from b200_experiment.config import save_config
     from b200_experiment.data import (
-        epoch_batch_indices,
         filter_overlong_prompt_records,
         read_records,
-        stable_sample_id,
-        tokenize_prompts,
         validate_prompt_records,
     )
-    from b200_experiment.distributed import DistributedContext
     from b200_experiment.models import load_models, load_student_tokenizer
-    from b200_experiment.trainer import _make_optimizer, seed_everything
+    from b200_experiment.trainer import seed_everything
     from b200_experiment.vllm_rollout import VLLMRolloutEngine
+    from torch.utils.tensorboard import SummaryWriter
 
     output_dir = args.output_dir.resolve()
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"Refusing to overwrite non-empty output: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     config = _load_resolved_config(main_repo, args.config.resolve(), output_dir)
+    if args.num_states is not None:
+        config["intervention"]["num_states"] = int(args.num_states)
+    if args.k_rollouts is not None:
+        config["intervention"]["num_continuations"] = int(args.k_rollouts)
+    if args.future_horizon is not None:
+        config["intervention"]["future_horizon"] = int(args.future_horizon)
+    if args.learning_rate is not None:
+        config["training"]["learning_rate"] = float(args.learning_rate)
     _validate_config(config)
-    if not torch.cuda.is_available():
-        raise RuntimeError("The B200 intervention experiment requires CUDA")
-    if torch.cuda.device_count() != 1:
-        raise RuntimeError(
-            "Experiment requires exactly one visible GPU per process; got "
-            f"{torch.cuda.device_count()}. Set CUDA_VISIBLE_DEVICES to one device."
-        )
+    log = ProgressLogger(output_dir / "progress.log")
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError("Set CUDA_VISIBLE_DEVICES to exactly one B200 GPU")
     torch.cuda.set_device(0)
     device = torch.device("cuda", 0)
-    physical_gpu = _cuda_device_identity(0)
-    distributed = DistributedContext(0, 0, 1, device)
     seed = int(config["experiment"]["seed"])
     seed_everything(seed)
 
-    records, data_files = read_records(
-        config["data"]["path"], split=config["data"].get("split")
-    )
+    records, data_files = read_records(config["data"]["path"], config["data"].get("split"))
     validate_prompt_records(records, config["data"])
-    prompt_tokenizer = load_student_tokenizer(config)
-    records, filter_summary = filter_overlong_prompt_records(
-        records, prompt_tokenizer, config["data"]
-    )
-    del prompt_tokenizer
-    save_config(config, output_dir / "resolved_config.yaml")
+    light_tokenizer = load_student_tokenizer(config)
+    records, filter_summary = filter_overlong_prompt_records(records, light_tokenizer, config["data"])
+    del light_tokenizer
+    resolved_yaml = output_dir / "resolved_config.yaml"
+    if resolved_yaml.exists():
+        previous = yaml.safe_load(resolved_yaml.read_text(encoding="utf-8"))
+        if _resume_signature(previous) != _resume_signature(config):
+            raise ValueError(
+                "Refusing to resume with a changed scientific configuration; "
+                "use the original settings or a new RUN_NAME"
+            )
+    else:
+        save_config(config, resolved_yaml)
+    resolved_json = output_dir / "resolved_config.json"
+    if not resolved_json.exists():
+        resolved_json.write_text(
+            json.dumps({k: v for k, v in config.items() if not k.startswith("_")}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    environment_path = output_dir / "environment.json"
+    if not environment_path.exists():
+        environment_path.write_text(
+            json.dumps(environment_payload(main_repo), indent=2) + "\n", encoding="utf-8"
+        )
 
-    gpu_lease = exclusive_gpu_lease(physical_gpu)
-    gpu_lease.__enter__()
+    identity = _cuda_identity()
+    writer = SummaryWriter(output_dir / config["logging"]["tensorboard"]["log_dir"])
     engine = VLLMRolloutEngine(config, output_dir)
     student = teacher = tokenizer = None
-    try:
-        memory_preflight = _validate_vllm_startup_memory(config)
-        print(
-            "GPU isolation: "
-            f"physical={physical_gpu} "
-            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
-            f"free={memory_preflight['free_gib']:.1f}/"
-            f"{memory_preflight['total_gib']:.1f} GiB "
-            f"required={memory_preflight['required_gib']:.1f} GiB",
-            flush=True,
-        )
-        engine.start()
-        student, teacher, tokenizer, model_metadata = load_models(config, device)
-        config["_tokenizer_eos_token_id"] = tokenizer.eos_token_id
-        config["_tokenizer_pad_token_id"] = tokenizer.pad_token_id
-        optimizer, fused = _make_optimizer(
-            [
-                parameter
-                for parameter in student.parameters()
-                if parameter.requires_grad
-            ],
-            config["training"],
-        )
-        metadata = {
-            "protocol": "paired_exact_prefix_single_state_intervention_v1",
-            "question": (
-                "After training on a state s_t, does the distribution/quality of "
-                "subsequent states visited by the student change, even when "
-                "immediate gains are matched?"
-            ),
-            "main_repo": str(main_repo),
-            "main_repo_commit": _git_commit(main_repo),
-            "command": sys.argv,
-            "model": model_metadata,
-            "data_files": [str(path) for path in data_files],
-            "data_filter": filter_summary,
-            "optimizer_fused": bool(fused),
-            "selection": "uniform_over_eligible_positions_without_D_or_future_outcome",
-            "state_definition": "s_t=prompt+y_<t; y_t excluded",
-            "local_update": "one_student_topk_OPD_state_weight_1_no_Gibbs",
-            "future_metric": "conditional_reverse_KL_on_each_visited_state_student_topk",
-            "paired_seeds": True,
-        }
-        (output_dir / "run_metadata.json").write_text(
-            json.dumps(metadata, indent=2, allow_nan=False) + "\n", encoding="utf-8"
-        )
-
-        events_path = output_dir / "events.jsonl"
-        audit_path = output_dir / "future_states.jsonl.gz"
-        max_steps = int(config["training"]["max_steps"])
-        intervention = config["intervention"]
-        num_probes = int(intervention["num_probe_rollouts"])
-        min_suffix = int(intervention["min_original_suffix_tokens"])
-        max_attempts = int(intervention["max_selection_attempts"])
-        with contextlib.ExitStack() as output_stack:
-            events_handle = output_stack.enter_context(
-                events_path.open("w", encoding="utf-8")
-            )
-            audit_handle = output_stack.enter_context(
-                gzip.open(audit_path, "wt", encoding="utf-8")
-            )
-            for event_id in range(max_steps):
-                selected = None
-                for attempt in range(max_attempts):
-                    schedule_step = event_id * max_attempts + attempt
-                    record_index = epoch_batch_indices(
-                        len(records), 1, schedule_step, seed
-                    )[0]
-                    record = records[record_index]
-                    encoded, _ = tokenize_prompts(
-                        [record], tokenizer, config["data"], device
-                    )
-                    normal_seed = seed + 1_000_000 + schedule_step
-                    rollout = engine.generate(
-                        student,
-                        encoded["input_ids"],
-                        encoded["attention_mask"],
-                        max_new_tokens=int(config["rollout"]["max_new_tokens"]),
-                        temperature=float(config["rollout"]["temperature"]),
-                        top_p=float(config["rollout"]["top_p"]),
-                        eos_token_ids=tokenizer.eos_token_id,
-                        pad_token_id=tokenizer.pad_token_id,
-                        seed=normal_seed,
-                    )
-                    response_length = int(rollout.valid_mask[0].sum().item())
-                    try:
-                        position_t = select_state_position(
-                            response_length,
-                            min_suffix,
-                            seed=seed + 2_000_000 + schedule_step,
-                        )
-                    except ValueError:
-                        continue
-                    selected = (
-                        record_index,
-                        record,
-                        encoded,
-                        rollout,
-                        response_length,
-                        position_t,
-                        normal_seed,
-                    )
-                    break
-                if selected is None:
-                    raise RuntimeError(
-                        f"Could not find an eligible trajectory for event {event_id} "
-                        f"after {max_attempts} on-policy attempts"
-                    )
-                (
-                    record_index,
-                    record,
-                    encoded,
-                    rollout,
-                    response_length,
-                    position_t,
-                    normal_seed,
-                ) = selected
-                student_scores, teacher_scores, pgt, cmt = _score_cmt_rollout(
-                    student, teacher, rollout, config
-                )
-                diagnostics = cmt.diagnostics
-                prefix = build_state_prefix(
-                    encoded["input_ids"][0],
-                    encoded["attention_mask"][0],
-                    rollout.response_ids[0, :response_length],
-                    position_t,
-                )
-                probe_seed_base = seed + 10_000_000 + event_id * 10_000
-                probe_seeds = paired_rollout_seeds(probe_seed_base, num_probes)
-                prefix_before = prefix.detach().clone()
-                before = _run_probe_phase(
-                    "before",
-                    engine,
-                    student,
-                    teacher,
-                    prefix_before,
-                    probe_seeds,
-                    event_id,
-                    config,
-                    audit_handle,
-                )
-
-                local_kl_before = float(
-                    pgt.diagnostics["restricted_reverse_kl"][0, position_t].item()
-                )
-                local_rollout, reference, update = _local_update(
-                    student,
-                    optimizer,
-                    rollout,
-                    student_scores,
-                    teacher_scores,
-                    position_t,
-                    config,
-                    device,
-                    distributed,
-                    event_id,
-                )
-                fixed_pre = fixed_support_reverse_kl(
-                    reference.old_student_log_probs[:, -1],
-                    reference.teacher_log_probs[:, -1],
-                )
-                if not torch.allclose(
-                    fixed_pre,
-                    torch.tensor([local_kl_before], device=fixed_pre.device),
-                    atol=2e-5,
-                    rtol=2e-5,
-                ):
-                    raise AssertionError(
-                        "Pre-update fixed-support KL disagrees with CMT restricted_reverse_kl"
-                    )
-                local_kl_after_tensor = _local_fixed_support_kl_after(
-                    student,
-                    local_rollout,
-                    reference.candidate_ids,
-                    reference.teacher_log_probs[:, -1],
-                    config,
-                )
-                local_kl_after = float(local_kl_after_tensor.item())
-
-                prefix_after = prefix.detach().clone()
-                assert_paired_probe_protocol(
-                    prefix_before, prefix_after, probe_seeds, probe_seeds
-                )
-                after = _run_probe_phase(
-                    "after",
-                    engine,
-                    student,
-                    teacher,
-                    prefix_after,
-                    probe_seeds,
-                    event_id,
-                    config,
-                    audit_handle,
-                )
-                event = {
-                    "event_id": event_id,
-                    "step": event_id + 1,
-                    "dataset_id": Path(config["data"]["path"]).name,
-                    "dataset_index": record_index,
-                    "sample_id": stable_sample_id(record, record_index),
-                    "normal_rollout_seed": normal_seed,
-                    "response_position_t": position_t,
-                    "predicted_action_y_t": int(
-                        rollout.response_ids[0, position_t].item()
-                    ),
-                    "prefix_length": int(prefix.numel()),
-                    "state_prefix_token_ids": [
-                        int(token) for token in prefix.detach().cpu().tolist()
-                    ],
-                    "local_fixed_support_token_ids": [
-                        int(token)
-                        for token in reference.candidate_ids[0, -1]
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    ],
-                    "local_student_log_probs_pre": [
-                        float(value)
-                        for value in reference.old_student_log_probs[0, -1]
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    ],
-                    "local_teacher_log_probs_fixed": [
-                        float(value)
-                        for value in reference.teacher_log_probs[0, -1]
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    ],
-                    "original_trajectory_length": response_length,
-                    "original_suffix_tokens_after_y_t": (
-                        response_length - position_t - 1
-                    ),
-                    "g_t": float(diagnostics["gain"][0, position_t].item()),
-                    "D_t": float(
-                        diagnostics["sequential_gain_raw"][0, position_t].item()
-                    ),
-                    "sequential_gain_raw": float(
-                        diagnostics["sequential_gain_raw"][0, position_t].item()
-                    ),
-                    "successor_excess": float(
-                        diagnostics["successor_excess"][0, position_t].item()
-                    ),
-                    "marginal_flux": float(
-                        diagnostics["marginal_flux"][0, position_t].item()
-                    ),
-                    "learning_value_raw": float(
-                        diagnostics["learning_value_raw"][0, position_t].item()
-                    ),
-                    "local_kl_before": local_kl_before,
-                    "local_kl_after": local_kl_after,
-                    "realized_local_improvement": local_kl_before - local_kl_after,
-                    "future_kl_before_mean": before["mean"],
-                    "future_kl_before_std": before["std"],
-                    "future_kl_after_mean": after["mean"],
-                    "future_kl_after_std": after["std"],
-                    "future_improvement": before["mean"] - after["mean"],
-                    "future_opd_proxy_before_mean": before["opd_proxy_mean"],
-                    "future_opd_proxy_after_mean": after["opd_proxy_mean"],
-                    "number_future_valid_states": {
-                        "before": before["count"],
-                        "after": after["count"],
-                    },
-                    "number_future_valid_states_before": before["count"],
-                    "number_future_valid_states_after": after["count"],
-                    "rollout_lengths": {
-                        "before": before["lengths"],
-                        "after": after["lengths"],
-                    },
-                    "paired_rollout_seeds": list(probe_seeds),
-                    "learning_rate": float(config["training"]["learning_rate"]),
-                    "gradient_norm": float(update["gradient_norm"]),
-                    "local_update_loss": float(update["loss"]),
-                    "local_update_base_topk_opd_loss": float(
-                        update["base_topk_opd_loss"]
-                    ),
-                    "local_update_supervised_states": 1,
-                    "local_update_optimizer_steps": int(update["optimizer_steps"]),
-                    "local_update_gibbs_allocations": int(update["gibbs_allocations"]),
-                    "top_k": int(config["selector"]["top_k"]),
-                    "selection_rule": "uniform_eligible_without_D_or_future",
-                    "prefix_sha256": hashlib.sha256(
-                        prefix.detach().cpu().numpy().tobytes()
-                    ).hexdigest(),
-                }
-                _append_jsonl(events_handle, event)
-                print(
-                    f"event={event_id + 1}/{max_steps} sample={event['sample_id']} "
-                    f"t={position_t} g={event['g_t']:.6g} "
-                    f"D={event['D_t']:.6g} local_delta="
-                    f"{event['realized_local_improvement']:.6g} future_delta="
-                    f"{event['future_improvement']:.6g}",
-                    flush=True,
-                )
-        analyze_output(output_dir, int(intervention["matched_g_bins"]))
-    finally:
+    with exclusive_gpu_lease(identity):
         try:
-            engine.close()
+            log(f"Protocol: {config['experiment']['protocol']} (no CMT/LIFT quantities)")
+            log(f"Models: teacher={config['models']['teacher_path']} student={config['models']['student_path']}")
+            log(f"Data: {data_files}; kept={filter_summary['kept_count']}")
+            engine.start()
+            student, teacher, tokenizer, model_metadata = load_models(config, device)
+            student.eval()
+            teacher.eval()
+            base_snapshot = snapshot_parameters(student)
+            log(f"Captured one fixed BF16 base snapshot with {len(base_snapshot)} tensors")
+            metadata_path = output_dir / "environment.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.update({"model": model_metadata, "data_filter": filter_summary})
+            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+            candidates = _collect_candidates(
+                output_dir / "candidate_states.jsonl", records, tokenizer, student,
+                engine, config, device, log
+            )
+            # This line is reached only after every state was generated by theta_base.
+            log(f"Candidate pool frozen before interventions: {len(candidates)} states")
+
+            intervention_path = output_dir / "interventions.jsonl"
+            continuation_path = output_dir / "continuations.jsonl.gz"
+            completed_rows = read_jsonl(intervention_path)
+            completed = {int(row["intervention_id"]) for row in completed_rows}
+            sanitize_continuation_audit(continuation_path, completed)
+            pending = pending_candidates(candidates, completed)
+            if completed:
+                log(f"Resume: preserving {len(completed)} completed interventions")
+            for candidate in pending:
+                intervention_id = int(candidate["candidate_id"])
+                restore_parameters_exact(student, base_snapshot)
+                prefix = torch.tensor(candidate["prefix_token_ids"], dtype=torch.long, device=device)
+                before_seeds, after_seeds = branch_seed_sets(
+                    seed + 10_000_000 + intervention_id * 10_000,
+                    int(config["intervention"]["num_continuations"]),
+                )
+                before_prefix = prefix.detach().clone()
+                before_rollout = _generate_suffixes(
+                    engine, student, before_prefix, before_seeds, config, tokenizer
+                )
+                update = _single_local_update(student, teacher, prefix, config)
+                after_prefix = prefix.detach().clone()
+                assert_same_prefix_independent_branches(
+                    before_prefix, after_prefix, before_seeds, after_seeds
+                )
+                after_rollout = _generate_suffixes(
+                    engine, student, after_prefix, after_seeds, config, tokenizer
+                )
+
+                # The evaluator is theta_base for both distributions.
+                optimizer = update.pop("optimizer")
+                del optimizer
+                restore_parameters_exact(student, base_snapshot)
+                gc.collect()
+                torch.cuda.empty_cache()
+                before_stats, before_audit, before_lengths = _score_suffixes_with_base(
+                    student, teacher, before_rollout, before_seeds, "before", config, tokenizer
+                )
+                after_stats, after_audit, after_lengths = _score_suffixes_with_base(
+                    student, teacher, after_rollout, after_seeds, "after", config, tokenizer
+                )
+                audit_rows = []
+                for row in before_audit + after_audit:
+                    row.update({
+                        "intervention_id": intervention_id,
+                        "candidate_id": intervention_id,
+                        "quality_evaluator": "restored_theta_base_student_and_frozen_teacher",
+                        "quality_support": "state_specific_student_top16_under_theta_base",
+                    })
+                    audit_rows.append(row)
+                append_gzip_jsonl(continuation_path, audit_rows)
+
+                event = {
+                    "intervention_id": intervention_id,
+                    "candidate_id": intervention_id,
+                    "dataset_index": candidate["dataset_index"],
+                    "sample_id": candidate["sample_id"],
+                    "state_position_t": candidate["state_position_t"],
+                    "t": candidate["state_position_t"],
+                    "prefix_length": candidate["prefix_length"],
+                    "local_support_definition": "fixed_student_top16_at_theta_base",
+                    "local_support_token_ids": update["support_ids"],
+                    "local_p_base_conditional": update["p_base_conditional"],
+                    "local_q_teacher_conditional": update["q_teacher_conditional"],
+                    "local_reverse_kl_before": update["d0"],
+                    "local_reverse_kl_after": update["d1"],
+                    "D0": update["d0"],
+                    "D1": update["d1"],
+                    "delta_immediate": update["delta_immediate"],
+                    "local_update_loss": update["loss"],
+                    "gradient_norm": update["gradient_norm"],
+                    "optimizer": {
+                        "name": "AdamW", "learning_rate": float(config["training"]["learning_rate"]),
+                        "betas": config["training"]["adam_betas"], "weight_decay": 0.0,
+                        "max_grad_norm": float(config["training"]["max_grad_norm"]),
+                        "steps": 1,
+                    },
+                    "before_future": before_stats,
+                    "after_future": after_stats,
+                    "future_quality_before_mean": before_stats["mean"],
+                    "future_quality_after_mean": after_stats["mean"],
+                    "future_before_mean": before_stats["mean"],
+                    "future_before_std": before_stats["std_across_continuation_means"],
+                    "future_after_mean": after_stats["mean"],
+                    "future_after_std": after_stats["std_across_continuation_means"],
+                    "delta_future": before_stats["mean"] - after_stats["mean"],
+                    "continuation_lengths_before": before_lengths,
+                    "continuation_lengths_after": after_lengths,
+                    "before_seeds": list(before_seeds),
+                    "after_seeds": list(after_seeds),
+                    "same_exact_prefix": True,
+                    "independent_branch_samples": True,
+                    "base_restoration_verified_exact": True,
+                    "future_evaluator": "theta_base",
+                    "grad_norm": update["gradient_norm"],
+                    "learning_rate": float(config["training"]["learning_rate"]),
+                    "K": int(config["intervention"]["num_continuations"]),
+                    "future_horizon": int(config["intervention"]["future_horizon"]),
+                }
+                validate_intervention_schema(event)
+                append_jsonl(intervention_path, event)
+                step = intervention_id + 1
+                writer.add_scalar("immediate/D0", update["d0"], step)
+                writer.add_scalar("immediate/D1", update["d1"], step)
+                writer.add_scalar("immediate/gain", event["delta_immediate"], step)
+                writer.add_scalar("update/grad_norm", update["gradient_norm"], step)
+                writer.add_scalar("downstream/before_mean", before_stats["mean"], step)
+                writer.add_scalar("downstream/after_mean", after_stats["mean"], step)
+                writer.add_scalar("downstream/delta", event["delta_future"], step)
+                writer.add_scalar("downstream/before_std", before_stats["std_across_continuation_means"], step)
+                writer.add_scalar("downstream/after_std", after_stats["std_across_continuation_means"], step)
+                writer.flush()
+                log(
+                    f"intervention={step}/{len(candidates)} "
+                    f"delta_immediate={event['delta_immediate']:.6g} "
+                    f"delta_future={event['delta_future']:.6g} restored_exact=true"
+                )
+            summary = analyze_output(output_dir)
+            final_rows = read_jsonl(intervention_path)
+            writer.add_histogram(
+                "final/delta_immediate",
+                torch.tensor([row["delta_immediate"] for row in final_rows]),
+                len(final_rows),
+            )
+            writer.add_histogram(
+                "final/delta_future",
+                torch.tensor([row["delta_future"] for row in final_rows]),
+                len(final_rows),
+            )
+            writer.flush()
+            log(f"Completed {summary['num_interventions']} interventions; Figure 1 written")
+        except BaseException:
+            if read_jsonl(output_dir / "interventions.jsonl"):
+                analyze_output(output_dir)
+            raise
         finally:
-            try:
-                distributed.close()
-            finally:
-                gpu_lease.__exit__(None, None, None)
+            writer.close()
+            engine.close()
+            del student, teacher, tokenizer
     return output_dir
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--main-repo", type=Path, required=True)
-    parser.add_argument(
-        "--config", type=Path, default=Path(__file__).resolve().parent / "config.yaml"
-    )
+    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.yaml"))
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--num-states", type=int)
+    parser.add_argument("--k-rollouts", type=int)
+    parser.add_argument("--future-horizon", type=int)
+    parser.add_argument("--learning-rate", type=float)
     args = parser.parse_args()
     output = run(args)
-    print(f"Completed intervention experiment: {output}")
+    print(f"Completed experiment: {output}")
     return 0
 
 
