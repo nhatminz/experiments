@@ -2,6 +2,8 @@
 # no CMT/TA selector or training objective is invoked.
 experiment:
   protocol: fixed_base_single_state_reverse_kl_v1
+  experiment_schema_version: 2
+  accuracy_analysis_enabled: true
   seed: 42
   require_b200: true
   allow_existing_output: true
@@ -32,7 +34,7 @@ rollout:
   vllm:
     gpu_memory_utilization: 0.60
     max_num_seqs: 16
-    max_model_len: 5500
+    max_model_len: 7500
     max_concurrent_requests: 16
 
 training:
@@ -60,6 +62,14 @@ intervention:
   matched_quantile_high: 0.55
   sensitivity_quantile_low: 0.40
   sensitivity_quantile_high: 0.60
+
+accuracy_analysis:
+  enabled: true
+  max_new_tokens: 2048
+  bootstrap_replicates: 2000
+  bootstrap_seed: 314159
+  benchmark: Competition-MATH
+  answer_key: answer
 
 logging:
   tensorboard:

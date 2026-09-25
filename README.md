@@ -18,8 +18,9 @@ does not call an OPD trainer or compute any TA/CMT/LIFT score.
    categorical distributions on `U_t`, and minimize
    `D0 = KL(p_bar_theta || q_bar)` for exactly one AdamW step.
 5. Generate eight independent pre-update and eight independent post-update
-   continuations from the *same exact prefix* (`temperature=1`, `top_p=1`,
-   horizon 128). The two branches use deterministic, disjoint seed sets.
+   continuations from the *same exact prefix* (`temperature=1`, `top_p=1`).
+   The two branches use deterministic, disjoint seed sets. Generation can
+   continue to 2048 tokens for grading, while the KL view remains horizon 128.
 6. Restore `theta_base` exactly. Only then score every descendant state from
    both branches using the restored base student and frozen teacher. Every
    state uses its own Student-Top16 support under `theta_base`; `s_t` itself is
@@ -27,6 +28,27 @@ does not call an OPD trainer or compute any TA/CMT/LIFT score.
 7. Record `Delta_immediate = D0-D1` and
    `Delta_future = F_before-F_after`. Figure 1 highlights the Q45--Q55
    immediate-gain band and reports Q40--Q60 as sensitivity analysis.
+
+## Accuracy extension (schema version 2)
+
+The extension does not redefine either Figure 1 quantity. Each before/after
+continuation is generated once, up to EOS or
+`ACCURACY_MAX_NEW_TOKENS=2048`. A bounded view of those same token IDs is used
+to score at most the first `FUTURE_HORIZON=128` valid descendant states; the
+full continuation is used only for Competition-MATH grading. Future KL is
+therefore never extended to all 2048 tokens.
+
+Candidate collection stores the assistant response prefix separately from the
+rendered user/chat prompt. The graded string is decoded from
+`response_prefix_token_ids + generated_token_ids`, so input problem tokens are
+not part of the answer. Correctness uses the existing
+`b200_experiment.evaluation.grade_evaluation_response` implementation.
+
+The additional analysis reports accuracy by future-KL quintile with
+intervention-clustered bootstrap CIs, the before-only control, association
+between downstream KL reduction and conditioned accuracy gain, and
+length/EOS/truncation controls. It creates a separate accuracy figure; the
+original Figure 1 remains unchanged.
 
 This is a checkpoint-local categorical intervention diagnostic. It does not
 claim to equal the full neural-parameter causal effect of a token update.
@@ -42,6 +64,8 @@ Each run writes:
 - `continuations.jsonl.gz` (raw tokens plus descendant quality values);
 - `summary.json`, `progress.log`, `figure1_caption.txt`;
 - `figure1.png` (320 dpi) and vector `figure1.pdf`;
+- `future_kl_accuracy_summary.json` and `future_kl_accuracy_table.csv`;
+- `future_kl_accuracy.png/.pdf`, caption, and optional LaTeX paragraph;
 - TensorBoard events under `tensorboard/`.
 
 Re-run with the same `RUN_NAME` (or `OUTPUT_DIR`) to resume. Completed
@@ -53,6 +77,10 @@ Optional controls include `MATCHED_QUANTILE_LOW/HIGH`,
 `CANDIDATE_COLLECTION_BATCH_SIZE`, and the model/data path variables shown in
 the launcher. Resume rejects any changed scientific setting.
 
+Schema-v1 128-token-only outputs are deliberately incompatible with this
+accuracy-enabled schema. Use a new `RUN_NAME`; the runner fails clearly rather
+than silently treating incomplete continuations as gradeable solutions.
+
 ## Canonical one-B200 run
 
 ```bash
@@ -62,8 +90,10 @@ MAIN_REPO=/workspace/storage-shared/nlp/minhpn19/BellmanOPD_analysis \
 CUDA_VISIBLE_DEVICES=0 \
 NUM_STATES=300 K_ROLLOUTS=8 FUTURE_HORIZON=128 \
 TOP_K=16 LEARNING_RATE=5e-6 SEED=42 \
+ACCURACY_MAX_NEW_TOKENS=2048 ENABLE_ACCURACY_ANALYSIS=1 \
+BOOTSTRAP_REPLICATES=2000 \
 ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION=0.60 \
-ROLLOUT_VLLM_MAX_MODEL_LEN=5500 \
+ROLLOUT_VLLM_MAX_MODEL_LEN=7500 \
   bash scripts/run_qwen3_4b_to_1p7b_compmath.sh
 ```
 
@@ -81,6 +111,7 @@ cd /workspace/storage-shared/nlp/minhpn19/Experiment
 MAIN_REPO=/workspace/storage-shared/nlp/minhpn19/BellmanOPD_analysis \
 CUDA_VISIBLE_DEVICES=0 NUM_STATES=3 K_ROLLOUTS=2 \
 FUTURE_HORIZON=16 CANDIDATE_ROLLOUT_HORIZON=128 \
+ACCURACY_MAX_NEW_TOKENS=256 BOOTSTRAP_REPLICATES=100 \
 RUN_NAME=figure1_smoke_seed42 \
   bash scripts/run_qwen3_4b_to_1p7b_compmath.sh
 ```

@@ -147,6 +147,46 @@ def descendant_offsets(generated_length: int) -> list[int]:
     return list(range(1, max(1, int(generated_length))))
 
 
+def kl_scoring_token_count(generated_length: int, future_horizon: int) -> int:
+    """Tokens needed to expose at most ``future_horizon`` descendants."""
+    if int(future_horizon) <= 0:
+        raise ValueError("future_horizon must be positive")
+    return min(int(generated_length), int(future_horizon) + 1)
+
+
+def resolve_reference_answer(record: Mapping[str, Any], configured_key: str = "answer") -> str:
+    """Resolve the existing math dataset's answer without changing its row."""
+    keys = (
+        configured_key,
+        "answer",
+        "solution",
+        "ground_truth",
+        "reference_answer",
+        "target",
+        "final_answer",
+    )
+    for key in keys:
+        value: Any = record
+        for part in str(key).split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                value = None
+                break
+            value = value[part]
+        if value is not None and str(value).strip():
+            return str(value)
+    raise KeyError(f"Could not resolve reference answer; available fields={sorted(record)}")
+
+
+def reconstruct_assistant_response(
+    tokenizer, assistant_prefix_ids: Sequence[int], continuation_ids: Sequence[int]
+) -> str:
+    """Decode assistant-only IDs; chat/user prompt IDs are never accepted."""
+    token_ids = [int(item) for item in assistant_prefix_ids] + [
+        int(item) for item in continuation_ids
+    ]
+    return tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
 def assert_finite_values(value: Any, path: str = "payload") -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():

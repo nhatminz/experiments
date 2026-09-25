@@ -20,6 +20,9 @@ export NUM_STATES="${NUM_STATES:-300}"
 export K_ROLLOUTS="${K_ROLLOUTS:-${NUM_CONTINUATIONS:-8}}"
 export NUM_CONTINUATIONS="${K_ROLLOUTS}"
 export FUTURE_HORIZON="${FUTURE_HORIZON:-128}"
+export ACCURACY_MAX_NEW_TOKENS="${ACCURACY_MAX_NEW_TOKENS:-2048}"
+export ENABLE_ACCURACY_ANALYSIS="${ENABLE_ACCURACY_ANALYSIS:-1}"
+export BOOTSTRAP_REPLICATES="${BOOTSTRAP_REPLICATES:-2000}"
 export TOP_K="${TOP_K:-16}"
 export LEARNING_RATE="${LEARNING_RATE:-5e-6}"
 export SEED="${SEED:-42}"
@@ -28,7 +31,7 @@ export CANDIDATE_COLLECTION_BATCH_SIZE="${CANDIDATE_COLLECTION_BATCH_SIZE:-8}"
 export ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
 export ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 export ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION="${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
-export ROLLOUT_VLLM_MAX_MODEL_LEN="${ROLLOUT_VLLM_MAX_MODEL_LEN:-5500}"
+export ROLLOUT_VLLM_MAX_MODEL_LEN="${ROLLOUT_VLLM_MAX_MODEL_LEN:-7500}"
 # =========================================================
 
 if [[ -z "${CUDA_VISIBLE_DEVICES//[[:space:]]/}" || "${CUDA_VISIBLE_DEVICES}" == *,* ]]; then
@@ -40,7 +43,7 @@ if [[ ! -f "${MAIN_REPO}/b200_experiment/models.py" ]]; then
   exit 2
 fi
 
-RUN_NAME="${RUN_NAME:-figure1_qwen3_4b_to_1p7b_compmath_n${NUM_STATES}_k${TOP_K}_seed${SEED}_$(date +%Y%m%d_%H%M%S)}"
+RUN_NAME="${RUN_NAME:-figure1_accuracy_v2_qwen3_4b_to_1p7b_compmath_n${NUM_STATES}_k${TOP_K}_seed${SEED}_$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${EXPERIMENT_DIR}/outputs}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}}"
 mkdir -p "${OUTPUT_DIR}"
@@ -51,6 +54,7 @@ echo "Teacher: ${TEACHER_MODEL}"
 echo "Student: ${STUDENT_MODEL}"
 echo "Data: ${TRAIN_DATA} [${PROMPT_KEY}, enable_thinking=false]"
 echo "States=${NUM_STATES} continuations/state=${NUM_CONTINUATIONS} future_horizon=${FUTURE_HORIZON}"
+echo "Accuracy: enabled=${ENABLE_ACCURACY_ANALYSIS} generation_horizon=${ACCURACY_MAX_NEW_TOKENS} bootstrap=${BOOTSTRAP_REPLICATES}"
 echo "Local update: Student Top-${TOP_K}, AdamW lr=${LEARNING_RATE}, one step"
 echo "Sampling: temperature=${ROLLOUT_TEMPERATURE} top_p=${ROLLOUT_TOP_P}"
 echo "Output: ${OUTPUT_DIR}"

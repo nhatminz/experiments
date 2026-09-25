@@ -10,6 +10,7 @@ import os
 import random
 import sys
 from pathlib import Path
+from statistics import fmean
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ import yaml
 
 from .gpu_isolation import exclusive_gpu_lease
 from .plotting import analyze_output
+from .accuracy_analysis import analyze_accuracy, intervention_accuracy_fields
 from .protocol import (
     assert_same_prefix_independent_branches,
     branch_seed_sets,
@@ -24,6 +26,9 @@ from .protocol import (
     descendant_offsets,
     fixed_support_reverse_kl,
     future_distribution_stats,
+    kl_scoring_token_count,
+    reconstruct_assistant_response,
+    resolve_reference_answer,
     select_state_position,
 )
 from .utils import (
@@ -49,6 +54,17 @@ def _env_int(name: str, default: int, *aliases: str) -> int:
 
 def _env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    if name not in os.environ:
+        return bool(default)
+    value = os.environ[name].strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {os.environ[name]!r}")
 
 
 def _eos_ids(tokenizer) -> list[int]:
@@ -139,6 +155,17 @@ def _load_resolved_config(main_repo: Path, overlay: Path, output_dir: Path):
     vllm["max_concurrent_requests"] = max(
         int(vllm.get("max_concurrent_requests", 1)), needed
     )
+    accuracy = config["accuracy_analysis"]
+    accuracy["enabled"] = _env_bool(
+        "ENABLE_ACCURACY_ANALYSIS", accuracy.get("enabled", True)
+    )
+    accuracy["max_new_tokens"] = _env_int(
+        "ACCURACY_MAX_NEW_TOKENS", accuracy["max_new_tokens"]
+    )
+    accuracy["bootstrap_replicates"] = _env_int(
+        "BOOTSTRAP_REPLICATES", accuracy["bootstrap_replicates"]
+    )
+    config["experiment"]["accuracy_analysis_enabled"] = accuracy["enabled"]
     return resolve_runtime_paths(config)
 
 
@@ -165,12 +192,19 @@ def _validate_config(config: dict[str, Any]) -> None:
         low, high = float(settings[low_key]), float(settings[high_key])
         if not 0.0 <= low < high <= 1.0:
             raise ValueError(f"Invalid quantile interval: {low_key}={low}, {high_key}={high}")
+    accuracy = config["accuracy_analysis"]
+    if int(accuracy["max_new_tokens"]) <= 0:
+        raise ValueError("accuracy_analysis.max_new_tokens must be positive")
+    if int(accuracy["bootstrap_replicates"]) <= 0:
+        raise ValueError("accuracy_analysis.bootstrap_replicates must be positive")
 
 
 def _resume_signature(config: dict[str, Any]) -> dict[str, Any]:
     """Fields that would alter an already-started scientific run."""
     return {
         "protocol": config["experiment"]["protocol"],
+        "experiment_schema_version": config["experiment"]["experiment_schema_version"],
+        "accuracy_analysis_enabled": config["experiment"]["accuracy_analysis_enabled"],
         "seed": config["experiment"]["seed"],
         "models": config["models"],
         "data": config["data"],
@@ -179,11 +213,52 @@ def _resume_signature(config: dict[str, Any]) -> dict[str, Any]:
             for key in ("max_new_tokens", "temperature", "top_p")
         },
         "intervention": config["intervention"],
+        "accuracy_analysis": config["accuracy_analysis"],
         "local_optimizer": {
             key: config["training"][key]
             for key in ("learning_rate", "adam_betas", "weight_decay", "max_grad_norm")
         },
     }
+
+
+def _assert_resume_schema(previous: dict[str, Any], current: dict[str, Any]) -> None:
+    previous_version = previous.get("experiment", {}).get(
+        "experiment_schema_version", 1
+    )
+    current_version = current["experiment"]["experiment_schema_version"]
+    if int(previous_version) != int(current_version):
+        raise ValueError(
+            "Incompatible Experiment output schema: this accuracy-enabled "
+            "runner requires schema version 2. Use a new RUN_NAME/output directory."
+        )
+
+
+def _validate_completed_accuracy_records(
+    rows: list[dict[str, Any]], *, enabled: bool
+) -> None:
+    if not enabled:
+        return
+    required = {
+        "accuracy_before",
+        "accuracy_after",
+        "delta_accuracy",
+        "pass8_before",
+        "pass8_after",
+        "delta_pass8",
+        "num_correct_before",
+        "num_correct_after",
+    }
+    incompatible = [
+        int(row.get("intervention_id", -1))
+        for row in rows
+        if not required.issubset(row)
+        or int(row.get("experiment_schema_version", 1)) != 2
+    ]
+    if incompatible:
+        raise ValueError(
+            "Completed records lack schema-v2 full-generation accuracy fields "
+            f"(first IDs: {incompatible[:5]}). Use a new RUN_NAME."
+        )
 
 
 def _cuda_identity() -> str:
@@ -202,11 +277,17 @@ def _generate_suffixes(engine, model, prefix, seeds, config, tokenizer):
         raise ValueError("vLLM batch generation requires consecutive row seeds")
     prompt_ids, prompt_mask = _prefix_batch(prefix, len(seeds))
     horizon = int(config["intervention"]["future_horizon"])
-    # L+1 generated actions expose L descendant pre-action states to the
-    # causal-LM scorer after excluding s_t at offset zero.
-    generation_tokens = horizon + 1
+    # Generate once for both measurements. KL later consumes only horizon+1
+    # tokens (offset zero plus at most `horizon` descendants); grading sees all.
+    generation_tokens = (
+        int(config["accuracy_analysis"]["max_new_tokens"])
+        if bool(config["accuracy_analysis"]["enabled"])
+        else horizon + 1
+    )
     if prefix.numel() + generation_tokens > int(config["rollout"]["vllm"]["max_model_len"]):
-        raise ValueError("State prefix plus future horizon exceeds vLLM max_model_len")
+        raise ValueError(
+            "State prefix plus accuracy generation horizon exceeds vLLM max_model_len"
+        )
     with torch.inference_mode():
         return engine.generate(
             model,
@@ -288,15 +369,36 @@ def _single_local_update(student, teacher, prefix, config):
     }
 
 
-def _score_suffixes_with_base(student, teacher, rollout, seeds, phase, config, tokenizer):
+def _slice_rollout_for_kl(rollout, future_horizon: int):
+    from b200_experiment.scoring import RolloutBatch
+
+    stop = min(
+        rollout.response_ids.shape[1], int(future_horizon) + 1
+    )
+    return RolloutBatch(
+        input_ids=rollout.input_ids[:, : rollout.prompt_width + stop],
+        attention_mask=rollout.attention_mask[:, : rollout.prompt_width + stop],
+        response_ids=rollout.response_ids[:, :stop],
+        valid_mask=rollout.valid_mask[:, :stop],
+        rollout_log_probs=rollout.rollout_log_probs[:, :stop],
+        prompt_width=rollout.prompt_width,
+    )
+
+
+def _score_suffixes_with_base(
+    student, teacher, rollout, seeds, phase, config, tokenizer, candidate
+):
+    from b200_experiment.evaluation import grade_evaluation_response
     from b200_experiment.scoring import score_student_teacher_rollout
 
     selector = config["selector"]
+    future_horizon = int(config["intervention"]["future_horizon"])
+    kl_rollout = _slice_rollout_for_kl(rollout, future_horizon)
     with torch.inference_mode():
         student_scores, teacher_scores = score_student_teacher_rollout(
             student,
             teacher,
-            rollout,
+            kl_rollout,
             score_chunk_steps=int(selector.get("score_chunk_steps", 128)),
             top_k=int(config["intervention"]["top_k"]),
             student_temperature=1.0,
@@ -314,30 +416,83 @@ def _score_suffixes_with_base(student, teacher, rollout, seeds, phase, config, t
     branches: list[list[float]] = []
     audit: list[dict[str, Any]] = []
     lengths = [int(x) for x in rollout.valid_mask.sum(dim=-1).cpu().tolist()]
-    for row, (seed, length) in enumerate(zip(seeds, lengths)):
+    kl_lengths = [
+        kl_scoring_token_count(length, future_horizon) for length in lengths
+    ]
+    eos_ids = set(_eos_ids(tokenizer))
+    response_prefix_ids = [int(item) for item in candidate["response_prefix_token_ids"]]
+    reference_answer = str(candidate["reference_answer"])
+    for row, (seed, length, kl_length) in enumerate(zip(seeds, lengths, kl_lengths)):
         # Offset zero is s_t itself. Only states after >=1 generated action are used.
-        offsets = descendant_offsets(length)[: int(config["intervention"]["future_horizon"])]
+        offsets = descendant_offsets(kl_length)[:future_horizon]
         values = [float(quality[row, offset].item()) for offset in offsets]
         branches.append(values)
+        generated_ids = [
+            int(x) for x in rollout.response_ids[row, :length].detach().cpu().tolist()
+        ]
+        reconstructed = reconstruct_assistant_response(
+            tokenizer, response_prefix_ids, generated_ids
+        )
+        correct = bool(grade_evaluation_response(
+            reconstructed,
+            {"answer": reference_answer},
+            benchmark=str(config["accuracy_analysis"]["benchmark"]),
+        ))
+        generation_limit = (
+            int(config["accuracy_analysis"]["max_new_tokens"])
+            if bool(config["accuracy_analysis"]["enabled"])
+            else future_horizon + 1
+        )
+        # The OpenAI-compatible vLLM endpoint can omit the matched stop token
+        # from ``token_ids``.  EOS is the only configured stop condition here,
+        # so an otherwise-short response is also an EOS termination.
+        terminated_by_eos = bool(
+            (generated_ids and generated_ids[-1] in eos_ids)
+            or length < generation_limit
+        )
+        truncated = bool(
+            not terminated_by_eos
+            and length >= generation_limit
+        )
         audit.append({
             "phase": phase,
             "branch": phase,
             "continuation_index": row,
             "rollout_index": row,
             "seed": int(seed),
+            "rng_seed": int(seed),
             "generated_token_ids": [
                 int(x) for x in rollout.response_ids[row, :length].detach().cpu().tolist()
             ],
             "generated_length": length,
             "decoded_continuation": tokenizer.decode(
-                rollout.response_ids[row, :length].detach().cpu().tolist(),
+                generated_ids,
                 skip_special_tokens=False,
             ),
+            "generated_continuation_text": tokenizer.decode(
+                generated_ids, skip_special_tokens=True
+            ),
+            "assistant_prefix_text": candidate["response_prefix_text"],
+            "reconstructed_full_response": reconstructed,
+            "reconstructed_response": reconstructed,
+            "reference_answer": reference_answer,
+            "predicted_correct": correct,
+            "correct": correct,
+            "terminated_by_eos": terminated_by_eos,
+            "truncated_at_accuracy_limit": truncated,
+            "accuracy_max_new_tokens": generation_limit,
+            "future_kl_horizon": future_horizon,
             "descendant_quality": values,
             "descendant_offsets": offsets,
             "num_evaluated_descendant_states": len(values),
+            "num_future_states_scored": len(values),
             "mean_future_reverse_kl": (
                 sum(values) / len(values) if values else None
+            ),
+            "future_kl_mean": sum(values) / len(values) if values else None,
+            "future_kl_std": (
+                float(torch.tensor(values).std(unbiased=False).item())
+                if values else None
             ),
         })
     return future_distribution_stats(branches), audit, lengths
@@ -403,10 +558,24 @@ def _collect_candidates(
             prefix = build_state_prefix(
                 encoded["input_ids"][row], encoded["attention_mask"][row], tokens, position
             )
-            if prefix.numel() + int(config["intervention"]["future_horizon"]) + 1 > int(
+            generation_horizon = (
+                int(config["accuracy_analysis"]["max_new_tokens"])
+                if bool(config["accuracy_analysis"]["enabled"])
+                else int(config["intervention"]["future_horizon"]) + 1
+            )
+            if prefix.numel() + generation_horizon > int(
                 config["rollout"]["vllm"]["max_model_len"]
             ):
                 continue
+            prompt_tokens = encoded["input_ids"][row][
+                encoded["attention_mask"][row].bool()
+            ]
+            response_prefix_ids = token_list[:position]
+            if prefix[int(prompt_tokens.numel()):].detach().cpu().tolist() != response_prefix_ids:
+                raise AssertionError("Assistant response prefix boundary is incorrect")
+            reference_answer = resolve_reference_answer(
+                record, config["accuracy_analysis"].get("answer_key", "answer")
+            )
             payload = {
                 "candidate_id": len(candidates),
                 "dataset_index": int(dataset_index),
@@ -417,6 +586,13 @@ def _collect_candidates(
                     prefix.detach().cpu().tolist(), skip_special_tokens=False
                 ),
                 "prefix_length": int(prefix.numel()),
+                "response_start_token_index": int(prompt_tokens.numel()),
+                "response_prefix_token_ids": response_prefix_ids,
+                "response_prefix_text": tokenizer.decode(
+                    response_prefix_ids, skip_special_tokens=True
+                ),
+                "problem_text": str(record.get(config["data"]["prompt_key"], "")),
+                "reference_answer": reference_answer,
                 "trajectory_length": length,
                 "candidate_rollout_seed": generation_seed + row,
                 "action_y_t": token_list[position],
@@ -471,6 +647,21 @@ def run(args: argparse.Namespace) -> Path:
         config["intervention"]["future_horizon"] = int(args.future_horizon)
     if args.learning_rate is not None:
         config["training"]["learning_rate"] = float(args.learning_rate)
+    if args.accuracy_max_new_tokens is not None:
+        config["accuracy_analysis"]["max_new_tokens"] = int(
+            args.accuracy_max_new_tokens
+        )
+    if args.enable_accuracy_analysis is not None:
+        config["accuracy_analysis"]["enabled"] = bool(
+            args.enable_accuracy_analysis
+        )
+        config["experiment"]["accuracy_analysis_enabled"] = bool(
+            args.enable_accuracy_analysis
+        )
+    if args.bootstrap_replicates is not None:
+        config["accuracy_analysis"]["bootstrap_replicates"] = int(
+            args.bootstrap_replicates
+        )
     _validate_config(config)
     log = ProgressLogger(output_dir / "progress.log")
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
@@ -488,6 +679,7 @@ def run(args: argparse.Namespace) -> Path:
     resolved_yaml = output_dir / "resolved_config.yaml"
     if resolved_yaml.exists():
         previous = yaml.safe_load(resolved_yaml.read_text(encoding="utf-8"))
+        _assert_resume_schema(previous, config)
         if _resume_signature(previous) != _resume_signature(config):
             raise ValueError(
                 "Refusing to resume with a changed scientific configuration; "
@@ -537,6 +729,10 @@ def run(args: argparse.Namespace) -> Path:
             intervention_path = output_dir / "interventions.jsonl"
             continuation_path = output_dir / "continuations.jsonl.gz"
             completed_rows = read_jsonl(intervention_path)
+            _validate_completed_accuracy_records(
+                completed_rows,
+                enabled=bool(config["accuracy_analysis"]["enabled"]),
+            )
             completed = {int(row["intervention_id"]) for row in completed_rows}
             sanitize_continuation_audit(continuation_path, completed)
             pending = pending_candidates(candidates, completed)
@@ -570,20 +766,32 @@ def run(args: argparse.Namespace) -> Path:
                 gc.collect()
                 torch.cuda.empty_cache()
                 before_stats, before_audit, before_lengths = _score_suffixes_with_base(
-                    student, teacher, before_rollout, before_seeds, "before", config, tokenizer
+                    student, teacher, before_rollout, before_seeds, "before", config,
+                    tokenizer, candidate
                 )
                 after_stats, after_audit, after_lengths = _score_suffixes_with_base(
-                    student, teacher, after_rollout, after_seeds, "after", config, tokenizer
+                    student, teacher, after_rollout, after_seeds, "after", config,
+                    tokenizer, candidate
                 )
                 audit_rows = []
                 for row in before_audit + after_audit:
                     row.update({
                         "intervention_id": intervention_id,
                         "candidate_id": intervention_id,
+                        "dataset_index": candidate["dataset_index"],
+                        "sample_id": candidate["sample_id"],
                         "quality_evaluator": "restored_theta_base_student_and_frozen_teacher",
                         "quality_support": "state_specific_student_top16_under_theta_base",
                     })
                     audit_rows.append(row)
+                accuracy_fields = intervention_accuracy_fields(
+                    [bool(row["predicted_correct"]) for row in before_audit],
+                    [bool(row["predicted_correct"]) for row in after_audit],
+                )
+                accuracy_before = float(accuracy_fields["accuracy_before"])
+                accuracy_after = float(accuracy_fields["accuracy_after"])
+                pass_before = int(accuracy_fields["pass8_before"])
+                pass_after = int(accuracy_fields["pass8_after"])
                 append_gzip_jsonl(continuation_path, audit_rows)
 
                 event = {
@@ -632,6 +840,14 @@ def run(args: argparse.Namespace) -> Path:
                     "learning_rate": float(config["training"]["learning_rate"]),
                     "K": int(config["intervention"]["num_continuations"]),
                     "future_horizon": int(config["intervention"]["future_horizon"]),
+                    "accuracy_max_new_tokens": int(
+                        config["accuracy_analysis"]["max_new_tokens"]
+                    ),
+                    **accuracy_fields,
+                    "generated_length_before_mean": fmean(before_lengths),
+                    "generated_length_after_mean": fmean(after_lengths),
+                    "experiment_schema_version": 2,
+                    "accuracy_analysis_enabled": bool(config["accuracy_analysis"]["enabled"]),
                 }
                 validate_intervention_schema(event)
                 append_jsonl(intervention_path, event)
@@ -645,6 +861,11 @@ def run(args: argparse.Namespace) -> Path:
                 writer.add_scalar("downstream/delta", event["delta_future"], step)
                 writer.add_scalar("downstream/before_std", before_stats["std_across_continuation_means"], step)
                 writer.add_scalar("downstream/after_std", after_stats["std_across_continuation_means"], step)
+                writer.add_scalar("accuracy/before", accuracy_before, step)
+                writer.add_scalar("accuracy/after", accuracy_after, step)
+                writer.add_scalar("accuracy/delta", event["delta_accuracy"], step)
+                writer.add_scalar("accuracy/pass8_before", pass_before, step)
+                writer.add_scalar("accuracy/pass8_after", pass_after, step)
                 writer.flush()
                 log(
                     f"intervention={step}/{len(candidates)} "
@@ -663,10 +884,37 @@ def run(args: argparse.Namespace) -> Path:
                 torch.tensor([row["delta_future"] for row in final_rows]),
                 len(final_rows),
             )
+            writer.add_histogram(
+                "final/delta_accuracy",
+                torch.tensor([row["delta_accuracy"] for row in final_rows]),
+                len(final_rows),
+            )
             writer.flush()
+            if bool(config["accuracy_analysis"]["enabled"]):
+                accuracy_summary, final_report = analyze_accuracy(
+                    output_dir,
+                    bootstrap_replicates=int(
+                        config["accuracy_analysis"]["bootstrap_replicates"]
+                    ),
+                    bootstrap_seed=int(config["accuracy_analysis"]["bootstrap_seed"]),
+                    zero_tolerance=summary.get("zero_tolerance"),
+                )
+                log("Future-KL/accuracy final report:\n" + final_report)
+                if float(accuracy_summary["truncation_rate"]) > 0.01:
+                    log(
+                        "WARNING: more than 1% of accuracy continuations reached "
+                        "ACCURACY_MAX_NEW_TOKENS; consider increasing the limit."
+                    )
             log(f"Completed {summary['num_interventions']} interventions; Figure 1 written")
         except BaseException:
             if read_jsonl(output_dir / "interventions.jsonl"):
+                completed_now = {
+                    int(row["intervention_id"])
+                    for row in read_jsonl(output_dir / "interventions.jsonl")
+                }
+                sanitize_continuation_audit(
+                    output_dir / "continuations.jsonl.gz", completed_now
+                )
                 analyze_output(output_dir)
             raise
         finally:
@@ -685,6 +933,17 @@ def main() -> int:
     parser.add_argument("--k-rollouts", type=int)
     parser.add_argument("--future-horizon", type=int)
     parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--accuracy-max-new-tokens", type=int)
+    parser.add_argument("--bootstrap-replicates", type=int)
+    accuracy_group = parser.add_mutually_exclusive_group()
+    accuracy_group.add_argument(
+        "--enable-accuracy-analysis", dest="enable_accuracy_analysis",
+        action="store_true", default=None
+    )
+    accuracy_group.add_argument(
+        "--disable-accuracy-analysis", dest="enable_accuracy_analysis",
+        action="store_false"
+    )
     args = parser.parse_args()
     output = run(args)
     print(f"Completed experiment: {output}")

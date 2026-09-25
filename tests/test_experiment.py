@@ -8,6 +8,12 @@ import pytest
 import torch
 
 from Experiment.plotting import matched_band, render_figure, summarize
+from Experiment.accuracy_analysis import (
+    analyze_accuracy,
+    cluster_resamples,
+    intervention_accuracy_fields,
+    validate_rollout_alignment,
+)
 from Experiment.protocol import (
     assert_same_prefix_independent_branches,
     branch_seed_sets,
@@ -16,8 +22,14 @@ from Experiment.protocol import (
     eligible_state_positions,
     fixed_support_reverse_kl,
     future_distribution_stats,
+    kl_scoring_token_count,
+    reconstruct_assistant_response,
 )
-from Experiment.run_experiment import _single_local_update
+from Experiment.run_experiment import (
+    _assert_resume_schema,
+    _single_local_update,
+    _validate_completed_accuracy_records,
+)
 from Experiment.utils import (
     pending_candidates,
     restore_parameters_exact,
@@ -116,6 +128,33 @@ def test_descendant_scoring_excludes_intervention_state():
     assert stats["num_states"] == 3
 
 
+def test_accuracy_generation_can_exceed_fixed_kl_horizon():
+    assert kl_scoring_token_count(2048, 128) == 129
+    assert len(descendant_offsets(kl_scoring_token_count(2048, 128))) == 128
+    assert kl_scoring_token_count(40, 128) == 40
+
+
+def test_reconstructed_response_is_assistant_only():
+    class Tokenizer:
+        def decode(self, ids, skip_special_tokens=True):
+            names = {99: "USER_PROBLEM", 10: "assistant-prefix", 11: " answer"}
+            return "".join(names[item] for item in ids)
+
+    response = reconstruct_assistant_response(Tokenizer(), [10], [11])
+    assert response == "assistant-prefix answer"
+    assert "USER_PROBLEM" not in response
+
+
+def test_accuracy_fields_use_same_k_before_and_after():
+    result = intervention_accuracy_fields(
+        [True, False, False, False], [True, True, False, False]
+    )
+    assert result["accuracy_before"] == 0.25
+    assert result["accuracy_after"] == 0.5
+    assert result["delta_accuracy"] == 0.25
+    assert result["delta_pass8"] == 0
+
+
 def test_future_scoring_occurs_only_after_exact_base_restore():
     source = Path(__file__).resolve().parents[1].joinpath("run_experiment.py").read_text()
     restore_index = source.index("restore_parameters_exact(student, base_snapshot)", source.index("del optimizer"))
@@ -176,3 +215,91 @@ def test_runtime_does_not_import_cmt_or_lift_selectors():
     assert "CMTSelector" not in source
     assert "PGTSelector" not in source
     assert "_opd_train_step" not in source
+    assert "grade_evaluation_response" in source
+    assert "kl_rollout = _slice_rollout_for_kl(rollout, future_horizon)" in source
+    assert "generated_ids" in source
+    assert "reconstruct_assistant_response(" in source
+    assert '"num_future_states_scored": len(values)' in source
+
+
+def test_cluster_bootstrap_samples_interventions_not_rollouts():
+    samples = cluster_resamples([0, 0, 0, 1, 1, 2], 20, seed=7)
+    assert len(samples) == 20
+    assert all(len(sample) == 3 for sample in samples)
+    assert all(set(sample).issubset({0, 1, 2}) for sample in samples)
+
+
+def test_alignment_and_schema_v2_resume_rejection():
+    events = [{"intervention_id": 0, "K": 2}]
+    continuations = [
+        {"intervention_id": 0, "branch": branch, "rollout_index": index}
+        for branch in ("before", "after") for index in range(2)
+    ]
+    validate_rollout_alignment(events, continuations)
+    with pytest.raises(ValueError, match="schema version 2"):
+        _assert_resume_schema(
+            {"experiment": {}},
+            {"experiment": {"experiment_schema_version": 2}},
+        )
+    with pytest.raises(ValueError, match="full-generation accuracy fields"):
+        _validate_completed_accuracy_records(
+            [{"intervention_id": 0, "experiment_schema_version": 1}],
+            enabled=True,
+        )
+
+
+def test_accuracy_analysis_smoke_and_original_figure1_unchanged(tmp_path: Path):
+    events = []
+    continuations = []
+    for event_id in range(3):
+        before_correct = [event_id == 0, False]
+        after_correct = [event_id < 2, event_id == 0]
+        fields = intervention_accuracy_fields(before_correct, after_correct)
+        events.append({
+            "intervention_id": event_id,
+            "K": 2,
+            "delta_immediate": 0.01 + event_id * 0.001,
+            "delta_future": -0.02 + event_id * 0.02,
+            "future_before_mean": 0.5,
+            "future_after_mean": 0.5 - (-0.02 + event_id * 0.02),
+            "generated_length_before_mean": 100.0,
+            "generated_length_after_mean": 110.0,
+            **fields,
+        })
+        for branch, correctness in (("before", before_correct), ("after", after_correct)):
+            for rollout_index, correct in enumerate(correctness):
+                continuations.append({
+                    "intervention_id": event_id,
+                    "branch": branch,
+                    "rollout_index": rollout_index,
+                    "future_kl_mean": 0.1 + 0.03 * event_id + 0.01 * rollout_index,
+                    "predicted_correct": correct,
+                    "generated_length": 90 + 10 * rollout_index,
+                    "terminated_by_eos": True,
+                    "truncated_at_accuracy_limit": False,
+                })
+    (tmp_path / "interventions.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in events), encoding="utf-8"
+    )
+    import gzip
+    with gzip.open(tmp_path / "continuations.jsonl.gz", "wt", encoding="utf-8") as handle:
+        for row in continuations:
+            handle.write(json.dumps(row) + "\n")
+    original_rows = _synthetic_rows()
+    augmented_rows = [dict(row, delta_accuracy=0.0) for row in original_rows]
+    assert summarize(original_rows) == summarize(augmented_rows)
+    summary, report = analyze_accuracy(
+        tmp_path, bootstrap_replicates=20, bootstrap_seed=3
+    )
+    assert summary["num_interventions"] == 3
+    assert summary["bootstrap_unit"] == "intervention_id"
+    assert "A. Rollout-level" in report
+    for name in (
+        "future_kl_accuracy_summary.json",
+        "future_kl_accuracy.png",
+        "future_kl_accuracy.pdf",
+        "future_kl_accuracy_table.csv",
+        "future_kl_accuracy_caption.txt",
+        "future_kl_accuracy_analysis.tex",
+    ):
+        assert (tmp_path / name).is_file()
